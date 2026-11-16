@@ -854,7 +854,14 @@ export class Intro {
     const wave = (w, h) => {
       const m = new THREE.Mesh(
         new THREE.PlaneGeometry(w, h),
-        this.additive(lineVert, waveFrag, { uR: { value: 0 }, uA: { value: 0 }, uW: { value: 0.05 } })
+        this.additive(lineVert, waveFrag, {
+          uR: { value: 0 }, uPrevR: { value: 0 }, uA: { value: 0 }, uW: { value: 0.05 },
+          // Компромисс между «круглым» и «широким» кольцом: полная компенсация пропорций
+          // (w/h) гнала волну за край кадра за пару кадров, без неё кромка по горизонтали
+          // выходила в 2.9 раза тоньше и мигала. Корень из пропорций уравнивает толщину
+          // по осям примерно вдвое, сохраняя прежний силуэт.
+          uAspect: { value: Math.sqrt(w > h ? w / h : h / w) },
+        })
       );
       m.renderOrder = 12;
       m.visible = false;
@@ -1442,19 +1449,40 @@ export class Intro {
     cg.scale.set(cgs, cgs, 1);
     cg.visible = cg.material.opacity > 0.003;
 
+    // МИГАНИЕ КОЛЕЦ. Плоскость волны — квадрат 34×34 при 16:9, поэтому один и тот же uW давал
+    // разную толщину кромки по осям (растянуто по x, тонко по y). Кромка титульной волны была
+    // 2 px и расширялась до ~2400 px/с по горизонтали — втрое быстрее предела Найквиста,
+    // то есть кольцо обгоняло само себя и стробоскопило (заметно с 8.1 с, затухая до ~9.6 с).
+    // Теперь: ширина задаётся в мировых единицах и не зависит от пропорций плоскости,
+    // кольца шире, мягче и растут медленнее.
     const w1 = seg(t, 4.5, 6.1);
     this.waveLogo.position.set(lcx, lcy, 0.3);
     this.waveLogo.visible = w1 > 0 && w1 < 1 && fxk(FX.waves) > 0;
-    // плоскость 34×34: радиус считаем в мировых единицах (до 9 — за краем кадра), ширина растёт с радиусом
+    // плоскость 34×34 (квадрат, uAspect = 1): радиус в мировых единицах, ширина растёт с радиусом
     this.waveLogo.material.uniforms.uR.value = (easeOutCubic(w1) * 9.2) / 17;
     this.waveLogo.material.uniforms.uA.value = Math.pow(1 - w1, 1.5) * 0.3 * (0.45 + 0.55 * seg(w1, 0, 0.12)) * fxk(FX.waves);
-    this.waveLogo.material.uniforms.uW.value = (0.12 + w1 * 0.55) / 17;
-    const w2 = seg(t - ts, 7.75, 9.2);
+    this.waveLogo.material.uniforms.uW.value = (0.26 + w1 * 0.75) / 17;
+    const w2 = seg(t - ts, 7.75, 9.4);
     this.waveTitle.position.set(TT.x, -0.66 + TT.y, 0.3);
     this.waveTitle.visible = w2 > 0 && w2 < 1 && fxk(FX.waves) > 0;
-    this.waveTitle.material.uniforms.uR.value = easeOutCubic(w2) * 1.0;
-    this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.8) * 0.3 * fxk(FX.waves);
-    this.waveTitle.material.uniforms.uW.value = 0.02 + w2 * 0.08;
+    // плоскость 26×9 (uAspect = 2.89): кольцо остаётся круглым, кромка по горизонтали
+    // больше не тоньше вертикальной в 2.9 раза — именно она мигала на быстром расширении
+    // Равномерное расширение вместо easeOutCubic: у кубической кривой скорость в начале втрое
+    // выше средней — отсюда стробоскоп на первых кадрах (8.0–8.3 с). Здесь пиковая скорость
+    // меньше, а широкий мягкий фронт успевает «пропечататься» на каждом кадре.
+    this.waveTitle.material.uniforms.uR.value = (0.35 * (1 - Math.pow(1 - w2, 1.6)) + 0.65 * w2) * 1.1;
+    this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.3) * 0.24 * fxk(FX.waves);
+    this.waveTitle.material.uniforms.uW.value = 0.09 + w2 * 0.12;
+    // uPrevR — радиус прошлого кадра, чтобы шейдер залил путь кромки (антиалиасинг по времени).
+    // Важно: след ограничен сверху (не больше 0.16 радиуса) и обнуляется, когда волна скрыта —
+    // иначе на старте нового круга prevR остаётся от прошлого прогона и вспыхивает весь диск.
+    for (const wm of [this.waveLogo, this.waveTitle]) {
+      const u = wm.material.uniforms;
+      const R = u.uR.value;
+      const prev = wm.visible ? Math.min(R, Math.max(wm.userData.prevR ?? R, R - 0.16)) : R;
+      u.uPrevR.value = prev;
+      wm.userData.prevR = R;
+    }
 
     // анаморфные полосы: нарастают к удару, вспыхивают на нём, оживают на названии и финальном блике
     this.streak.strength = PO.streak * Math.min(1.1,
