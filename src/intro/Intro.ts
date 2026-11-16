@@ -13,7 +13,7 @@ import { EASE, logoXf, letterXf } from './anim';
 
 import {
   bgVert, bgFrag, dustVert, dustFrag, swarmVert, swarmFrag, sparkVert, sparkFrag,
-  arcVert, arcFrag, lineVert, lineFrag, textVert, textFrag, waveFrag, finalPass,
+  arcVert, arcFrag, lineVert, lineFrag, textVert, textFrag, waveFrag, finalPass, traceVert, traceFrag,
 } from './shaders';
 import { makeGold, makeEnvironment, sharedGold } from './gold';
 import { buildLogoParts, P } from './logo';
@@ -355,8 +355,14 @@ export class Intro {
     const pr = rng(33);
     this.logoRand = this.logoParts.map(() => pr());
 
+    // световая обводка контура: один материал на все детали, фазы разбросаны, чтобы штрих «пересекал» эмблему
+    this.traceU = { uHead: { value: 0 }, uAmp: { value: 0 }, uHead2: { value: 0 }, uAmp2: { value: 0 }, uBase: { value: 0 } };
+    const traceMat = new THREE.ShaderMaterial({
+      vertexShader: traceVert, fragmentShader: traceFrag, uniforms: this.traceU,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    });
     // каждая деталь вращается вокруг собственного центра — это нужно пресетам анимации
-    this.logoMeshes = this.logoParts.map((p) => {
+    this.logoMeshes = this.logoParts.map((p, pi) => {
       const mat = makeGold({ gradBot: -0.1, gradTop: 3.15, env: 1.6 });
       const u = mat.userData.u;
       u.uCenter.value.set(0, 0, 0);
@@ -369,6 +375,8 @@ export class Intro {
       m.position.z += p.z;
       m.visible = false;
       inner.add(m);
+      const tr = this.makeTrace(p, traceMat, pi);
+      if (tr) m.add(tr);
       return m;
     });
 
@@ -423,6 +431,33 @@ export class Intro {
     sp.build(inner);
 
     this.scene.add(this.logoRoot);
+  }
+
+  /** Линии контуров детали с параметром вдоль периметра (aT) — для светящейся обводки. */
+  makeTrace(p, mat, pi, byX = false) {
+    const pos: number[] = [], t: number[] = [];
+    p.rings.forEach((ring, ri) => {
+      const n = ring.length;
+      if (n < 3) return;
+      const cum = [0];
+      for (let i = 1; i <= n; i++) cum.push(cum[i - 1] + ring[i % n].distanceTo(ring[i - 1]));
+      const len = cum[n] || 1;
+      const ph = byX ? 0 : ((pi * 0.37 + ri * 0.21) % 1) * 0.85;
+      for (let i = 0; i < n; i++) {
+        const a = ring[i], b = ring[(i + 1) % n];
+        pos.push(a.x - p.center.x, a.y - p.center.y, a.z - p.center.z, b.x - p.center.x, b.y - p.center.y, b.z - p.center.z);
+        if (byX) t.push((a.x + 9) / 18, (b.x + 9) / 18); // положение вдоль названия — в той же шкале, что и бегущий луч
+        else t.push(cum[i] / len + ph, cum[i + 1] / len + ph);
+      }
+    });
+    if (!pos.length) return null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aT', new THREE.Float32BufferAttribute(t, 1));
+    const ls = new THREE.LineSegments(g, mat);
+    ls.frustumCulled = false;
+    ls.renderOrder = 8;
+    return ls;
   }
 
   /** Циркуль «вычерчивает» дуги вокруг эмблемы: светящаяся головка бежит по окружности и оставляет тонкий след. */
@@ -508,6 +543,11 @@ export class Intro {
 
     const sp = this.makeSparks();
     const r = rng(99);
+    const edgeU = { uHead: { value: -1 }, uAmp: { value: 0 }, uHead2: { value: 0 }, uAmp2: { value: 0 }, uBase: { value: 0 } };
+    const edgeMat = new THREE.ShaderMaterial({
+      vertexShader: traceVert, fragmentShader: traceFrag, uniforms: edgeU,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    });
     const meshes = letters.map((L, i) => {
       L.geometry.translate(-L.center.x, -L.center.y, -L.center.z);
       const mat = makeGold({ gradBot: -1.15, gradTop: -0.1, env: T.env, roughness: T.roughness });
@@ -519,6 +559,8 @@ export class Intro {
       m.position.copy(L.center);
       m.visible = false;
       group.add(m);
+      const edge = this.makeTrace({ rings: L.rings || [], center: L.center }, edgeMat, i, true);
+      if (edge) m.add(edge);
       const start = T.start + rank[i] * T.stagger;
       const land = start + T.duration * 0.78;
       for (let k = 0; k < T.sparkCount; k++) {
@@ -540,6 +582,7 @@ export class Intro {
     this.titleRoot = root;
     this.titleGroup = group;
     this.titleBaseY = baseY;
+    this.titleEdgeU = edgeU;
     this.letterMeshes = meshes;
     this.scene.add(root);
   }
@@ -1222,6 +1265,14 @@ export class Intro {
       m.material.envMapIntensity = LG.env;
     });
 
+    // световая обводка контура: первый круг сразу после удара, второй — вместе с финальным бликом
+    const tp = seg(gt, 4.62, 7.4), tp2 = seg(t, TL.sweep2 + 0.1, TL.sweep2 + 1.9);
+    this.traceU.uHead.value = easeInOutCubic(tp) * 1.6;
+    this.traceU.uAmp.value = easeOutCubic(seg(gt, 4.62, 4.8)) * (1 - easeInOutSine(seg(gt, 6.6, 7.6))) * LG.flash * fxk(1);
+    this.traceU.uHead2.value = easeInOutSine(tp2) * 1.3;
+    this.traceU.uAmp2.value = Math.sin(Math.PI * tp2) * fxk(FX.sweep) * LG.flash;
+    this.traceU.uBase.value = 0.05 * easeOutCubic(seg(gt, 5.2, 7.5)) * fxk(1);
+
     // дуги циркуля вокруг эмблемы (повторяют трансформацию эмблемы)
     const ct = lt('compass');
     this.compassRoot.visible = CP.enabled;
@@ -1275,6 +1326,10 @@ export class Intro {
     this.sweepLight.intensity = swAmt * 58;
     sharedGold.uSweepX.value = sw.x;
     sharedGold.uSweepAmt.value = swAmt;
+    // кромки букв вспыхивают, когда по ним пробегает луч
+    this.titleEdgeU.uHead.value = (sw.x + 9) / 18;
+    this.titleEdgeU.uAmp.value = swAmt * 0.9;
+    this.titleEdgeU.uBase.value = 0.025 * easeOutCubic(seg(tt, TT.start + 1.6, TT.start + 3.2)) * fxk(1);
 
     // dividers
     const dt = lt('dividers');

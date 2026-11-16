@@ -437,3 +437,25 @@ export const finalPass = {
     }
   `,
 };
+
+/** Световая «обводка» контура эмблемы: яркая головка бежит по периметру и оставляет затухающий след. */
+export const traceVert = /* glsl */ `
+attribute float aT;
+varying float vT;
+void main(){
+  vT = aT;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+export const traceFrag = /* glsl */ `
+uniform float uHead, uAmp, uHead2, uAmp2, uBase;
+varying float vT;
+float trail(float h){
+  float d = fract(h - vT);
+  float head = exp(-d * 5.5);
+  return head * smoothstep(0.0, 0.0025, 1.0 - d) * (0.35 + 0.65 * exp(-d * 60.0));
+}
+void main(){
+  float v = uAmp * trail(uHead) + uAmp2 * trail(uHead2) * 0.8 + uBase;
+  if (v < 0.003) discard;
+  gl_FragColor = vec4(vec3(2.9, 2.0, 0.9) * v, 1.0);
+}`;

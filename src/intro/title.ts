@@ -1,6 +1,7 @@
 // @ts-nocheck
 import * as THREE from 'three';
 import { parse as parseFont } from 'opentype.js';
+import { fixRings, flattenCaps } from './polyfix';
 import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 export interface Letter {
@@ -8,6 +9,7 @@ export interface Letter {
   geometry: THREE.BufferGeometry;
   center: THREE.Vector3; // final centre in title space
   size: THREE.Vector3;
+  rings?: THREE.Vector3[][]; // контуры передней грани (для световой кромки)
 }
 
 const fontCache = new Map<string, Promise<any>>();
@@ -55,14 +57,35 @@ export async function buildTitle(fontUrls: string[], text: string, targetWidth: 
   const letters: Letter[] = [];
   for (const it of lay.items) {
     const path = it.g.getPath(it.x, 0, fs);
-    const sp = new THREE.ShapePath();
+    // контуры глифа → ломаные (кривые разворачиваются адаптивно), затем ремонт: наложения, самопересечения, дыры
+    const rings = [];
+    let ring = null, cx = 0, cy = 0;
+    const steps = (len) => Math.max(6, Math.min(40, Math.ceil(len / (fs * 0.012))));
     for (const c of path.commands) {
-      if (c.type === 'M') sp.moveTo(c.x, -c.y);
-      else if (c.type === 'L') sp.lineTo(c.x, -c.y);
-      else if (c.type === 'Q') sp.quadraticCurveTo(c.x1, -c.y1, c.x, -c.y);
-      else if (c.type === 'C') sp.bezierCurveTo(c.x1, -c.y1, c.x2, -c.y2, c.x, -c.y);
+      if (c.type === 'M') { if (ring && ring.length > 2) rings.push(ring); ring = [{ x: c.x, y: -c.y }]; cx = c.x; cy = c.y; }
+      else if (!ring) continue;
+      else if (c.type === 'L') { ring.push({ x: c.x, y: -c.y }); cx = c.x; cy = c.y; }
+      else if (c.type === 'Q') {
+        const n = steps(Math.hypot(c.x1 - cx, c.y1 - cy) + Math.hypot(c.x - c.x1, c.y - c.y1));
+        for (let i = 1; i <= n; i++) {
+          const t = i / n, u = 1 - t;
+          ring.push({ x: u * u * cx + 2 * u * t * c.x1 + t * t * c.x, y: -(u * u * cy + 2 * u * t * c.y1 + t * t * c.y) });
+        }
+        cx = c.x; cy = c.y;
+      } else if (c.type === 'C') {
+        const n = steps(Math.hypot(c.x1 - cx, c.y1 - cy) + Math.hypot(c.x2 - c.x1, c.y2 - c.y1) + Math.hypot(c.x - c.x2, c.y - c.y2));
+        for (let i = 1; i <= n; i++) {
+          const t = i / n, u = 1 - t;
+          ring.push({
+            x: u * u * u * cx + 3 * u * u * t * c.x1 + 3 * u * t * t * c.x2 + t * t * t * c.x,
+            y: -(u * u * u * cy + 3 * u * u * t * c.y1 + 3 * u * t * t * c.y2 + t * t * t * c.y),
+          });
+        }
+        cx = c.x; cy = c.y;
+      } else if (c.type === 'Z') { if (ring && ring.length > 2) rings.push(ring); ring = null; }
     }
-    const shapes = sp.toShapes();
+    if (ring && ring.length > 2) rings.push(ring);
+    const shapes = fixRings(rings, { scale: 200_000 / Math.max(fs, 1e-6), rule: 'nonzero', weld: fs * 0.0004, minArea: fs * fs * 1e-6 });
     if (!shapes.length) continue;
     const g0 = new THREE.ExtrudeGeometry(shapes, {
       depth,
@@ -73,11 +96,18 @@ export async function buildTitle(fontUrls: string[], text: string, targetWidth: 
       curveSegments: 14,
     });
     g0.translate(-lay.width / 2, 0, -depth / 2);
-    const g = toCreasedNormals(g0, 0.5);
+    const g = flattenCaps(toCreasedNormals(g0, 0.5));
     g0.dispose();
     g.computeBoundingBox();
     const bb = g.boundingBox;
+    const zf = depth / 2 + bevel + 0.003;
+    const edgeRings = [];
+    for (const sh of shapes) {
+      const { shape, holes } = sh.extractPoints(1);
+      for (const ring of [shape, ...holes]) edgeRings.push(ring.map((q) => new THREE.Vector3(q.x - lay.width / 2, q.y, zf)));
+    }
     letters.push({
+      rings: edgeRings,
       char: it.ch,
       geometry: g,
       center: bb.getCenter(new THREE.Vector3()),
