@@ -67,6 +67,8 @@ export class Intro {
   playing = false;
   t = 0;
   private startAt = 0;
+  private anchor = 0;
+  private anchorPending = false;
   private pxW = 1920;
   private pxH = 1080;
   private forced = false;
@@ -123,6 +125,7 @@ export class Intro {
     this.setupDust();
     this.setupArcs();
     this.setupLogo();
+    this.setupCompassRings();
     await this.setupTitle();
     if (this.disposed) { this.dispose(); return; }
     this.setupSubtitle();
@@ -135,7 +138,23 @@ export class Intro {
     this.ro.observe(this.host);
 
 
+    this.warmUp();
     renderer.setAnimationLoop(() => this.frame());
+  }
+
+  /** Компилируем все шейдеры и заливаем текстуры до старта, чтобы таймлайн не «съедал» начало ролика. */
+  warmUp() {
+    try {
+      this.renderer.compile(this.scene, this.camera);
+      for (const t of [0.6, 2.6, 4.6, 5.6, 7.1, 9.8, 11.6]) {
+        this.update(t);
+        this.composer.render();
+      }
+      this.renderer.getContext().finish();
+    } catch (e) {
+      console.warn('warm-up failed', e);
+    }
+    this.update(0);
   }
 
   /* ------------------------------------------------------------ setup parts */
@@ -381,6 +400,35 @@ export class Intro {
     sp.build(inner);
 
     this.scene.add(this.logoRoot);
+  }
+
+  /** Циркуль «вычерчивает» дуги вокруг эмблемы: светящаяся головка бежит по окружности и оставляет тонкий след. */
+  setupCompassRings() {
+    const glow = this.glowTex();
+    const d2r = Math.PI / 180;
+    this.compass = [
+      { R: 2.08, w: 0.0075, alpha: 1.0, dash: 0, t0: 5.0, t1: 6.9, mirror: 1 },
+      { R: 2.3, w: 0.005, alpha: 0.75, dash: 120, t0: 5.3, t1: 7.3, mirror: -1 },
+    ].map((d) => {
+      const mat = this.additive(arcVert, arcFrag, {
+        uProg: { value: 0 }, uR: { value: d.R }, uStart: { value: -15 * d2r }, uLen: { value: 210 * d2r },
+        uDash: { value: d.dash }, uAlpha: { value: d.alpha }, uW: { value: d.w }, uTime: this.U.uTime,
+      }, { depthTest: false, side: THREE.DoubleSide });
+      const m = new THREE.Mesh(new THREE.RingGeometry(d.R - 0.12, d.R + 0.12, 360, 1), mat);
+      m.renderOrder = 3;
+      m.scale.x = d.mirror;
+      m.position.z = -0.15;
+      m.visible = false;
+      this.logoRoot.add(m);
+      const head = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: glow, color: new THREE.Color(2.6, 1.8, 0.8), blending: THREE.AdditiveBlending,
+        depthWrite: false, depthTest: false, transparent: true,
+      }));
+      head.renderOrder = 6;
+      head.visible = false;
+      this.logoRoot.add(head);
+      return { m, head, ...d, a0: -15 * d2r, len: 210 * d2r };
+    });
   }
 
   makeSparks() {
@@ -669,7 +717,7 @@ export class Intro {
       this.scene.add(m);
       return m;
     };
-    this.waveLogo = wave(14, 14);
+    this.waveLogo = wave(34, 34);
     this.waveLogo.position.set(0, lc.y, 0.3);
     this.waveTitle = wave(26, 9);
     this.waveTitle.position.set(0, -0.66, 0.3);
@@ -715,6 +763,8 @@ export class Intro {
   /* ------------------------------------------------------------ playback */
   play(from = 0) {
     this.startAt = performance.now() - from * 1000;
+    this.anchor = from;
+    this.anchorPending = true;
     this.playing = true;
     this.freeze = null;
   }
@@ -798,6 +848,8 @@ export class Intro {
         this.freeze = previousFreeze;
         this.playing = wasPlaying;
         this.startAt = performance.now() - previousTime * 1000;
+        this.anchor = previousTime;
+        this.anchorPending = true;
         this.applySize();
         this.renderer.setAnimationLoop(() => this.frame());
       }
@@ -826,7 +878,11 @@ export class Intro {
   frame() {
     this.adaptQuality();
     if (this.freeze !== null) this.t = this.freeze;
-    else if (this.playing) this.t = (performance.now() - this.startAt) / 1000;
+    else if (this.playing) {
+      // первый кадр после play/seek: якорим время, чтобы долгий кадр (загрузка/компиляция) не сдвигал таймлайн
+      if (this.anchorPending) { this.startAt = performance.now() - this.anchor * 1000; this.anchorPending = false; }
+      this.t = (performance.now() - this.startAt) / 1000;
+    }
     this.update(this.t);
     this.composer.render();
     this.onFrame?.(this.t);
@@ -848,6 +904,9 @@ export class Intro {
     // удар в момент появления эмблемы: короткий «толчок» камеры и дрожь
     const punch = burst(t, 4.5, 0.045, 0.55);
     const shake = burst(t, 4.5, 0.02, 0.22);
+    // «замах»: кадр чуть отъезжает и темнеет перед ударом, затем резко бьёт вперёд
+    const windup = easeInOutSine(seg(t, 3.85, 4.5)) * (t < 4.5 ? 1 : 0);
+    this.camera.position.z += windup * 0.38;
     this.camera.position.z -= punch * 0.75;
     this.camera.position.x += Math.sin(t * 83) * 0.045 * shake;
     this.camera.position.y += Math.cos(t * 71) * 0.035 * shake;
@@ -858,7 +917,10 @@ export class Intro {
     // global fade-in
     const fadeIn = easeOutCubic(seg(t, 0.95, 2.2));
     const F = this.fp.uniforms;
-    F.uFade.value = fadeIn;
+    const dip = 0.3 * easeInOutSine(seg(t, 4.1, 4.48)) * (t < 4.5 ? 1 : 0);
+    // в экспортируемом видео картинка уходит в чёрный вместе со звуком
+    const fadeOut = this.forced ? 1 - easeInOutSine(seg(t, 13.0, 13.6)) : 1;
+    F.uFade.value = fadeIn * (1 - dip) * fadeOut;
     F.uTime.value = t;
 
     // ПРОЛОГ: искра → линия света → «щель» раскрывается в cinemascope → удар раскрывает кадр целиком
@@ -876,7 +938,7 @@ export class Intro {
     F.uShock.value = easeOutCubic(shk) * 1.15;
     F.uShockAmp.value = t < 4.5 ? 0 : Math.pow(1 - shk, 1.6);
     F.uCA.value = burst(t, 4.5, 0.04, 0.45) * 0.9;
-    F.uPulse.value = burst(t, 4.5, 0.03, 0.2) * 0.1;
+    F.uPulse.value = burst(t, 4.5, 0.03, 0.2) * 0.05;
     const lp = this.logoCenter.clone().project(this.camera);
     F.uShockC.value = [lp.x * 0.5 + 0.5, lp.y * 0.5 + 0.5];
 
@@ -890,7 +952,7 @@ export class Intro {
     bu.uBeam.value = easeOutCubic(seg(t, 0.4, 3.4)) * (0.92 + 0.08 * Math.sin(t * 0.7)) * (1 + 0.15 * burst(t, 4.5, 0.1, 0.8));
     bu.uRib.value = easeOutCubic(seg(t, 1.0, 4.0)) * (0.9 + 0.1 * Math.sin(t * 0.9 + 1));
     bu.uGlow.value = easeOutCubic(seg(t, 3.5, 6.5));
-    bu.uFlash.value = burst(t, 4.5, 0.06, 0.5) * 0.2 + burst(t, TL.sweep2, 0.3, 0.7) * 0.15;
+    bu.uFlash.value = burst(t, 4.5, 0.06, 0.5) * 0.11 + burst(t, TL.sweep2, 0.3, 0.7) * 0.15;
     bu.uFinal.value = easeOutCubic(seg(t, 7.5, 10.5));
 
     // particles
@@ -918,9 +980,25 @@ export class Intro {
       s.visible = sc > 0.001;
     });
 
+    // дуги циркуля вокруг эмблемы
+    this.compass.forEach((c) => {
+      const k = seg(t, c.t0, c.t1);
+      const e = easeInOutCubic(k);
+      c.m.visible = k > 0;
+      c.m.material.uniforms.uProg.value = e;
+      c.m.material.uniforms.uAlpha.value = c.alpha * (1 - 0.45 * easeInOutSine(seg(t, 7.6, 9.4)));
+      const a = c.a0 + c.len * e;
+      c.head.position.set(Math.cos(a) * c.R * c.mirror, Math.sin(a) * c.R, -0.1);
+      const ping = burst(t, c.t1, 0.05, 0.35);
+      const hs = (k > 0 && k < 1 ? 0.3 : 0) + ping * 0.6;
+      c.head.scale.set(hs, hs, 1);
+      c.head.visible = hs > 0.01;
+    });
+
     // logo swarm assembly
     this.swarmU.uAssemble.value = easeInOutSine(seg(t, 1.6, 4.55));
-    this.swarmU.uFade.value = easeOutCubic(seg(t, 1.5, 2.4)) * (1 - easeInOutSine(seg(t, 4.5, 5.2)));
+    // на ударе рой кратко приглушаем (иначе 18 000 аддитивных точек выжигают силуэт) и быстрее растворяем
+    this.swarmU.uFade.value = easeOutCubic(seg(t, 1.5, 2.4)) * (1 - 0.6 * burst(t, 4.5, 0.03, 0.22)) * (1 - easeInOutSine(seg(t, 4.5, 4.95)));
     const rot = 0.62 * (1 - easeInOutCubic(seg(t, 1.4, 8.0)));
     this.logoRoot.rotation.y = rot + Math.sin(t * 0.5) * 0.015;
     this.logoRoot.rotation.x = Math.sin(t * 0.4) * 0.012;
@@ -933,7 +1011,7 @@ export class Intro {
       const u = m.material.userData.u;
       u.uReveal.value = easeInOutSine(k) * 1.0;
       m.visible = k > 0.0001;
-      u.uFlash.value = burst(t, 4.52, 0.05, 0.5) * 0.5 + burst(t, p.start + p.dur * 0.9, 0.05, 0.4) * 0.3;
+      u.uFlash.value = burst(t, 4.52, 0.05, 0.5) * 0.3 + burst(t, p.start + p.dur * 0.9, 0.05, 0.4) * 0.3;
     });
 
     // title letters
@@ -953,7 +1031,7 @@ export class Intro {
     // sweeping light (title + final shimmer)
     const sw = this.sweepState(t);
     this.sweepLight.position.x = sw.x;
-    this.sweepLight.intensity = sw.amt * 75;
+    this.sweepLight.intensity = sw.amt * 58;
     sharedGold.uSweepX.value = sw.x;
     sharedGold.uSweepAmt.value = sw.amt;
 
@@ -988,7 +1066,7 @@ export class Intro {
       f.s.visible = v > 0.003;
       f.s.scale.set(f.sx * (0.7 + 0.5 * Math.min(1, v)), f.sy * (0.6 + 0.6 * Math.min(1, v)), 1);
     };
-    setFlare(this.flareLogo, burst(t, 4.5, 0.07, 0.4) * 0.38 + 0.1 * easeOutCubic(seg(t, 5.5, 8)) * (0.8 + 0.2 * Math.sin(t * 0.8)));
+    setFlare(this.flareLogo, burst(t, 4.5, 0.07, 0.4) * 0.26 + 0.1 * easeOutCubic(seg(t, 5.5, 8)) * (0.8 + 0.2 * Math.sin(t * 0.8)));
     setFlare(this.flareTitle, burst(t, 7.7, 0.25, 0.7) * 0.5 + 0.14 * easeOutCubic(seg(t, 7.5, 10)) + burst(t, TL.sweep2 + 0.4, 0.3, 0.7) * 0.35);
     setFlare(this.flareSub, burst(t, 9.6, 0.3, 0.6) * 0.45);
     const cg = this.coreGlow;
@@ -999,26 +1077,27 @@ export class Intro {
 
     const w1 = seg(t, 4.5, 6.1);
     this.waveLogo.visible = w1 > 0 && w1 < 1;
-    this.waveLogo.material.uniforms.uR.value = easeOutCubic(w1) * 1.05;
-    this.waveLogo.material.uniforms.uA.value = Math.pow(1 - w1, 1.6) * 0.42;
-    this.waveLogo.material.uniforms.uW.value = 0.02 + w1 * 0.1;
+    // плоскость 34×34: радиус считаем в мировых единицах (до 9 — за краем кадра), ширина растёт с радиусом
+    this.waveLogo.material.uniforms.uR.value = (easeOutCubic(w1) * 9.2) / 17;
+    this.waveLogo.material.uniforms.uA.value = Math.pow(1 - w1, 1.5) * 0.3 * (0.45 + 0.55 * seg(w1, 0, 0.12));
+    this.waveLogo.material.uniforms.uW.value = (0.12 + w1 * 0.55) / 17;
     const w2 = seg(t, 7.75, 9.2);
     this.waveTitle.visible = w2 > 0 && w2 < 1;
     this.waveTitle.material.uniforms.uR.value = easeOutCubic(w2) * 1.0;
-    this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.8) * 0.35;
+    this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.8) * 0.3;
     this.waveTitle.material.uniforms.uW.value = 0.02 + w2 * 0.08;
 
     // анаморфные полосы: нарастают к удару, вспыхивают на нём, оживают на названии и финальном блике
     this.streak.strength = Math.min(1.1,
       0.1 * easeOutCubic(seg(t, 2.6, 4.5)) +
-      0.55 * burst(t, 4.5, 0.05, 0.9) +
+      0.3 * burst(t, 4.5, 0.05, 0.8) +
       0.1 * burst(t, 7.7, 0.25, 0.8) +
       0.05 * easeOutCubic(seg(t, 8, 10)) +
       0.09 * burst(t, TL.sweep2 + 0.3, 0.35, 0.7)) * easeOutCubic(seg(t, 1.5, 2.5));
     // объёмные лучи света из эмблемы
     F.uRays.value =
       0.12 * easeInOutSine(seg(t, 3.0, 4.5)) * (t < 4.5 ? 1 : 0) +
-      0.4 * burst(t, 4.5, 0.05, 0.9) +
+      0.2 * burst(t, 4.5, 0.05, 0.8) +
       0.05 * easeOutCubic(seg(t, 6, 9)) * (0.85 + 0.15 * Math.sin(t * 0.9)) +
       0.03 * burst(t, TL.sweep2 + 0.3, 0.4, 0.7);
 
@@ -1037,7 +1116,7 @@ export class Intro {
     });
 
     // bloom breathes with the story
-    this.bloom.strength = 0.5 + 0.2 * burst(t, 4.5, 0.08, 0.7) + 0.1 * burst(t, TL.sweep2, 0.4, 0.9);
+    this.bloom.strength = 0.5 + 0.1 * burst(t, 4.5, 0.08, 0.6) + 0.1 * burst(t, TL.sweep2, 0.4, 0.9);
   }
 
   popDiamond(m, k, t, phase) {

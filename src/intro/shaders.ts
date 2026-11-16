@@ -308,10 +308,16 @@ varying vec2 vUv;
 void main(){
   vec2 c=(vUv-.5)*2.;
   float d=length(c);
-  float ringDist=(d-uR)/uW;
-  float ring=exp(-ringDist*ringDist);
-  float a=ring*uA;
-  gl_FragColor=vec4(vec3(1.,0.72,0.3)*2.4, a);
+  float x=(d-uR)/uW;
+  // резкий передний фронт, длинный мягкий шлейф позади, тонкое раскалённое ядро
+  float lead=exp(-x*x*7.)*step(0.,x)+exp(-x*x*60.)*step(x,0.);
+  float tail=exp(x*0.85)*step(x,0.)*0.34;
+  float core=exp(-x*x*140.);
+  // мягкая маска у границ плоскости: кольцо никогда не упирается в «квадратный» край
+  float edge=1.-smoothstep(0.78,1.0,max(abs(c.x),abs(c.y)));
+  float a=(lead*0.5+tail+core*1.1)*uA*edge;
+  vec3 col=mix(vec3(1.,0.62,0.22)*1.9, vec3(1.,0.93,0.74)*2.6, clamp(core+lead*0.4,0.,1.));
+  gl_FragColor=vec4(col, a);
 }
 `;
 
@@ -397,6 +403,9 @@ export const finalPass = {
       col*=1.-v*0.62;
       // warm grade
       col=pow(max(col, vec3(0.)), vec3(0.98,1.0,1.04));
+      // холодные тени: сине-зелёный оттенок в чёрном подчёркивает золото
+      float lum=dot(col,vec3(.3,.5,.2));
+      col+=vec3(-0.002,0.004,0.011)*(1.-smoothstep(0.0,0.35,lum));
       // film grain / dither
       float gr=h21(vUv*uRes+fract(uTime*7.13)*173.)-.5;
       col+=gr*0.02*(1.-0.4*col);
