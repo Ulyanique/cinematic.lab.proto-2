@@ -18,6 +18,7 @@ import {
 import { makeGold, makeEnvironment, sharedGold } from './gold';
 import { buildLogoParts, P } from './logo';
 import { buildTitle } from './title';
+import { StreakPass } from './streak';
 
 /* ------------------------------------------------------------ helpers */
 const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
@@ -587,6 +588,31 @@ export class Intro {
     return t;
   }
 
+  starTex() {
+    const S = 256;
+    const c = document.createElement('canvas');
+    c.width = c.height = S;
+    const g = c.getContext('2d');
+    const img = g.createImageData(S, S);
+    for (let y = 0; y < S; y++)
+      for (let x = 0; x < S; x++) {
+        const u = (x / (S - 1) - 0.5) * 2, v = (y / (S - 1) - 0.5) * 2;
+        const r = Math.hypot(u, v);
+        const arm = (a, b) => Math.exp(-b * b * 900) * Math.pow(Math.max(0, 1 - Math.abs(a)), 3.2);
+        const cross = arm(u, v) + arm(v, u);
+        const d = Math.SQRT1_2;
+        const diag = 0.35 * (arm((u + v) * d, (u - v) * d) + arm((u - v) * d, (u + v) * d));
+        const core = Math.exp(-r * r * 60) * 1.2;
+        const a = Math.min(1, cross + diag + core);
+        const i = (y * S + x) * 4;
+        img.data[i] = 255; img.data[i + 1] = 238; img.data[i + 2] = 200; img.data[i + 3] = a * 255;
+      }
+    g.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+
   setupFX() {
     const flareT = this.flareTex();
     const mkFlare = (x, y, sx, sy) => {
@@ -603,6 +629,27 @@ export class Intro {
     this.flareLogo = mkFlare(0, lc.y - 0.2, 15, 1.4);
     this.flareTitle = mkFlare(0, -0.66, 18, 1.0);
     this.flareSub = mkFlare(0, P(0, 537).y, 10, 0.5);
+
+    // звёздные блики на золоте: четырёхлучевые «искры» в точках эмблемы и на кромках букв
+    const starT = this.starTex();
+    this.glints = [];
+    const addGlint = (x, y, size, phase) => {
+      const s = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: starT, color: new THREE.Color(2.6, 1.9, 1.0), blending: THREE.AdditiveBlending,
+        depthWrite: false, depthTest: false, transparent: true, opacity: 0,
+      }));
+      s.position.set(x, y, 0.5);
+      s.renderOrder = 13;
+      s.visible = false;
+      this.scene.add(s);
+      this.glints.push({ s, x, size, phase });
+    };
+    [[545, 285, 1.5], [748, 275, 1.3], [640, 148, 1.2], [602, 352, 1.0], [694, 352, 1.0], [676, 190, 0.9]].forEach(([px, py, k], i) =>
+      addGlint(P(px, py).x, P(px, py).y, k, i * 1.7));
+    [0, 3, 5, 8, 11, 14].forEach((li, i) => {
+      const L = this.letterMeshes[Math.min(li, this.letterMeshes.length - 1)].L;
+      addGlint(L.center.x - L.size.x * 0.28, this.titleBaseY + L.center.y + L.size.y * 0.5, 1.15 + (i % 2) * 0.25, 3 + i * 1.3);
+    });
 
     const glow = this.glowTex();
     this.coreGlow = new THREE.Sprite(
@@ -636,6 +683,8 @@ export class Intro {
     this.composer.addPass(new RenderPass(this.scene, this.camera));
     this.bloom = new UnrealBloomPass(new THREE.Vector2(320, 180), 0.6, 0.7, 1.0);
     this.composer.addPass(this.bloom);
+    this.streak = new StreakPass();
+    this.composer.addPass(this.streak);
     this.composer.addPass(new OutputPass());
     this.fp = new ShaderPass({ ...finalPass, uniforms: THREE.UniformsUtils.clone(finalPass.uniforms) });
     this.composer.addPass(this.fp);
@@ -827,7 +876,7 @@ export class Intro {
     F.uShock.value = easeOutCubic(shk) * 1.15;
     F.uShockAmp.value = t < 4.5 ? 0 : Math.pow(1 - shk, 1.6);
     F.uCA.value = burst(t, 4.5, 0.04, 0.45) * 0.9;
-    F.uPulse.value = burst(t, 4.5, 0.03, 0.2) * 0.18;
+    F.uPulse.value = burst(t, 4.5, 0.03, 0.2) * 0.1;
     const lp = this.logoCenter.clone().project(this.camera);
     F.uShockC.value = [lp.x * 0.5 + 0.5, lp.y * 0.5 + 0.5];
 
@@ -841,7 +890,7 @@ export class Intro {
     bu.uBeam.value = easeOutCubic(seg(t, 0.4, 3.4)) * (0.92 + 0.08 * Math.sin(t * 0.7)) * (1 + 0.15 * burst(t, 4.5, 0.1, 0.8));
     bu.uRib.value = easeOutCubic(seg(t, 1.0, 4.0)) * (0.9 + 0.1 * Math.sin(t * 0.9 + 1));
     bu.uGlow.value = easeOutCubic(seg(t, 3.5, 6.5));
-    bu.uFlash.value = burst(t, 4.5, 0.06, 0.5) * 0.28 + burst(t, TL.sweep2, 0.3, 0.7) * 0.15;
+    bu.uFlash.value = burst(t, 4.5, 0.06, 0.5) * 0.2 + burst(t, TL.sweep2, 0.3, 0.7) * 0.15;
     bu.uFinal.value = easeOutCubic(seg(t, 7.5, 10.5));
 
     // particles
@@ -871,7 +920,7 @@ export class Intro {
 
     // logo swarm assembly
     this.swarmU.uAssemble.value = easeInOutSine(seg(t, 1.6, 4.55));
-    this.swarmU.uFade.value = easeOutCubic(seg(t, 1.5, 2.4)) * (1 - easeInOutSine(seg(t, 4.5, 5.8)));
+    this.swarmU.uFade.value = easeOutCubic(seg(t, 1.5, 2.4)) * (1 - easeInOutSine(seg(t, 4.5, 5.2)));
     const rot = 0.62 * (1 - easeInOutCubic(seg(t, 1.4, 8.0)));
     this.logoRoot.rotation.y = rot + Math.sin(t * 0.5) * 0.015;
     this.logoRoot.rotation.x = Math.sin(t * 0.4) * 0.012;
@@ -939,11 +988,11 @@ export class Intro {
       f.s.visible = v > 0.003;
       f.s.scale.set(f.sx * (0.7 + 0.5 * Math.min(1, v)), f.sy * (0.6 + 0.6 * Math.min(1, v)), 1);
     };
-    setFlare(this.flareLogo, burst(t, 4.5, 0.07, 0.5) * 0.6 + 0.1 * easeOutCubic(seg(t, 5.5, 8)) * (0.8 + 0.2 * Math.sin(t * 0.8)));
+    setFlare(this.flareLogo, burst(t, 4.5, 0.07, 0.4) * 0.38 + 0.1 * easeOutCubic(seg(t, 5.5, 8)) * (0.8 + 0.2 * Math.sin(t * 0.8)));
     setFlare(this.flareTitle, burst(t, 7.7, 0.25, 0.7) * 0.5 + 0.14 * easeOutCubic(seg(t, 7.5, 10)) + burst(t, TL.sweep2 + 0.4, 0.3, 0.7) * 0.35);
     setFlare(this.flareSub, burst(t, 9.6, 0.3, 0.6) * 0.45);
     const cg = this.coreGlow;
-    cg.material.opacity = easeOutCubic(seg(t, 3.0, 4.6)) * 0.28 * (1 - 0.6 * seg(t, 5, 7)) + burst(t, 4.5, 0.06, 0.5) * 0.16;
+    cg.material.opacity = easeOutCubic(seg(t, 3.0, 4.6)) * 0.28 * (1 - 0.6 * seg(t, 5, 7)) + burst(t, 4.5, 0.06, 0.4) * 0.09;
     const cgs = 6 + burst(t, 4.5, 0.06, 0.8) * 3;
     cg.scale.set(cgs, cgs, 1);
     cg.visible = cg.material.opacity > 0.003;
@@ -958,6 +1007,34 @@ export class Intro {
     this.waveTitle.material.uniforms.uR.value = easeOutCubic(w2) * 1.0;
     this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.8) * 0.35;
     this.waveTitle.material.uniforms.uW.value = 0.02 + w2 * 0.08;
+
+    // анаморфные полосы: нарастают к удару, вспыхивают на нём, оживают на названии и финальном блике
+    this.streak.strength = Math.min(1.1,
+      0.1 * easeOutCubic(seg(t, 2.6, 4.5)) +
+      0.55 * burst(t, 4.5, 0.05, 0.9) +
+      0.1 * burst(t, 7.7, 0.25, 0.8) +
+      0.05 * easeOutCubic(seg(t, 8, 10)) +
+      0.09 * burst(t, TL.sweep2 + 0.3, 0.35, 0.7)) * easeOutCubic(seg(t, 1.5, 2.5));
+    // объёмные лучи света из эмблемы
+    F.uRays.value =
+      0.12 * easeInOutSine(seg(t, 3.0, 4.5)) * (t < 4.5 ? 1 : 0) +
+      0.4 * burst(t, 4.5, 0.05, 0.9) +
+      0.05 * easeOutCubic(seg(t, 6, 9)) * (0.85 + 0.15 * Math.sin(t * 0.9)) +
+      0.03 * burst(t, TL.sweep2 + 0.3, 0.4, 0.7);
+
+    // звёздные блики: пробегают вслед за световым лучом и редко мерцают в финале
+    this.glints.forEach((gl, i) => {
+      const dx = (gl.x - sw.x) * 0.8;
+      const swept = Math.exp(-dx * dx) * sw.amt * (t > 5.9 ? 1 : 0);
+      const tw = Math.pow(0.5 + 0.5 * Math.sin(t * 1.35 + gl.phase), 18) * 0.7 * easeOutCubic(seg(t, 9, 11));
+      const intro = burst(t, 4.7 + i * 0.07, 0.08, 0.35) * (i < 6 ? 0.9 : 0);
+      const v = Math.min(1, swept + tw + intro);
+      gl.s.visible = v > 0.01;
+      gl.s.material.opacity = v;
+      const sc = gl.size * (0.35 + 0.9 * v);
+      gl.s.scale.set(sc, sc, 1);
+      gl.s.material.rotation = 0.12 * Math.sin(t * 0.8 + gl.phase) + (1 - v) * 0.3;
+    });
 
     // bloom breathes with the story
     this.bloom.strength = 0.5 + 0.2 * burst(t, 4.5, 0.08, 0.7) + 0.1 * burst(t, TL.sweep2, 0.4, 0.9);

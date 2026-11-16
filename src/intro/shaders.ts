@@ -332,12 +332,13 @@ export const finalPass = {
     uShockC: { value: [0.5, 0.6] },
     uCA: { value: 0 },         // дополнительная хроматическая аберрация
     uPulse: { value: 0 },      // вспышка экспозиции
+    uRays: { value: 0 },       // объёмные лучи из эмблемы
   },
   vertexShader: /* glsl */ `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
   fragmentShader: /* glsl */ `
     precision highp float;
     uniform sampler2D tDiffuse;
-    uniform float uTime, uFade, uAspect, uOpen, uLine, uLineI, uBlur, uShock, uShockAmp, uCA, uPulse;
+    uniform float uTime, uFade, uAspect, uOpen, uLine, uLineI, uBlur, uShock, uShockAmp, uCA, uPulse, uRays;
     uniform vec2 uRes, uShockC;
     varying vec2 vUv;
     float h21(vec2 p){ vec3 p3=fract(vec3(p.xyx)*.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
@@ -376,6 +377,20 @@ export const finalPass = {
         col.b=texture2D(tDiffuse, uv-off).b;
       }
 
+      // объёмные лучи (god rays): радиальное размытие ярких зон к центру эмблемы
+      if(uRays>0.002){
+        vec2 delta=(uv-uShockC)*0.62/24.;
+        vec2 suv=uv-delta*h21(vUv*uRes+3.7);
+        vec3 rays=vec3(0.); float decay=1.;
+        for(int i=0;i<24;i++){
+          suv-=delta;
+          vec3 s=texture2D(tDiffuse,suv).rgb;
+          float l=max(max(s.r,s.g),s.b);
+          rays+=s*smoothstep(0.5,0.95,l)*decay;
+          decay*=0.955;
+        }
+        col+=rays/24.*uRays*vec3(1.0,0.74,0.4)*2.2;
+      }
       col*=1.+uPulse;
       // vignette
       float v=smoothstep(0.30,1.05,length(d*vec2(uAspect*0.72,1.15)));

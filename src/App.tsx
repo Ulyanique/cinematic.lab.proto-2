@@ -133,6 +133,17 @@ export default function App() {
     }
   }, []);
 
+  // браузеры запрещают автозвук: первый клик/касание по сцене включает саундтрек в синхроне с картинкой
+  useEffect(() => {
+    const onFirst = (e: PointerEvent) => {
+      if (e.target instanceof HTMLElement && e.target.closest('button,a,video,[role=slider]')) return;
+      window.removeEventListener('pointerdown', onFirst, true);
+      if (!scoreRef.current?.enabled) toggleSound();
+    };
+    window.addEventListener('pointerdown', onFirst, true);
+    return () => window.removeEventListener('pointerdown', onFirst, true);
+  }, [toggleSound]);
+
   const toggleFs = () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else rootRef.current?.requestFullscreen?.();
