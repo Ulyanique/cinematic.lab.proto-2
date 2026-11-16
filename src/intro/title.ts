@@ -10,31 +10,47 @@ export interface Letter {
   size: THREE.Vector3;
 }
 
-export async function buildTitle(fontUrl: string, text: string, targetWidth: number, tracking = 0.06) {
-  const response = await fetch(fontUrl);
-  if (!response.ok) throw new Error(`Не удалось загрузить шрифт: ${response.status}`);
-  const buf = await response.arrayBuffer();
-  const font = parseFont(buf);
+const fontCache = new Map<string, Promise<any>>();
+function loadFont(url: string) {
+  if (!fontCache.has(url)) {
+    fontCache.set(
+      url,
+      fetch(url).then(async (r) => {
+        if (!r.ok) throw new Error(`Не удалось загрузить шрифт: ${r.status}`);
+        return parseFont(await r.arrayBuffer());
+      })
+    );
+  }
+  return fontCache.get(url)!;
+}
+
+export interface TitleOpts { tracking: number; depth: number; bevel: number }
+
+/** Строит 3D-буквы. `fontUrls` — подмножества одного шрифта (кириллица + латиница). */
+export async function buildTitle(fontUrls: string[], text: string, targetWidth: number, opts: TitleOpts) {
+  const fonts = await Promise.all(fontUrls.map(loadFont));
+  const main = fonts[0];
+  const { tracking, depth, bevel } = opts;
+  const pick = (ch: string) => fonts.find((f) => f.charToGlyphIndex(ch) > 0) ?? main;
 
   const layout = (fs: number) => {
     let x = 0;
     const items: any[] = [];
-    let prev: any = null;
+    let prev: any = null, prevFont: any = null;
     for (const ch of text) {
+      const font = pick(ch);
       const g = font.charToGlyph(ch);
-      if (prev) x += font.getKerningValue(prev, g) * (fs / font.unitsPerEm);
-      const adv = (g.advanceWidth * fs) / font.unitsPerEm;
-      if (ch !== ' ') items.push({ ch, g, x });
-      prev = g;
+      if (prev && prevFont === font) x += font.getKerningValue(prev, g) * (fs / font.unitsPerEm);
+      const adv = ((g.advanceWidth || font.unitsPerEm * 0.3) * fs) / font.unitsPerEm;
+      if (ch !== ' ' && ch !== '\n') items.push({ ch, g, x });
+      prev = g; prevFont = font;
       x += adv + tracking * fs;
     }
-    return { items, width: x - tracking * fs };
+    return { items, width: Math.max(0.0001, x - tracking * fs) };
   };
   const base = layout(1);
   const fs = targetWidth / base.width;
   const lay = layout(fs);
-  const bevel = 0.04;
-  const depth = 0.15;
 
   const letters: Letter[] = [];
   for (const it of lay.items) {
@@ -50,7 +66,7 @@ export async function buildTitle(fontUrl: string, text: string, targetWidth: num
     if (!shapes.length) continue;
     const g0 = new THREE.ExtrudeGeometry(shapes, {
       depth,
-      bevelEnabled: true,
+      bevelEnabled: bevel > 0.001,
       bevelThickness: bevel,
       bevelSize: bevel * 0.8,
       bevelSegments: 5,
@@ -68,7 +84,6 @@ export async function buildTitle(fontUrl: string, text: string, targetWidth: num
       size: bb.getSize(new THREE.Vector3()),
     });
   }
-  // cap height for vertical centring
-  const capH = ((font.tables.os2?.sCapHeight || 700) * fs) / font.unitsPerEm;
+  const capH = ((main.tables.os2?.sCapHeight || 700) * fs) / main.unitsPerEm;
   return { letters, capH, width: lay.width, fontSize: fs };
 }

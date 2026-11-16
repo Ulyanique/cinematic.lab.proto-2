@@ -1,17 +1,20 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Intro } from './intro/Intro';
 import { ScorePlayer } from './intro/audio';
+import { DEFAULT_CONFIG, DESIGN_IMPACT, cloneConfig, sanitizeConfig, setPath, totalDuration, type Config } from './intro/config';
+import { CompositionPanel, GearIcon, LayersIcon, SettingsPanel, type Tab } from './ui/Panels';
 
-const CHAPTERS = [
-  { t: 1.05, label: 'Свет' },
-  { t: 4.5, label: 'Эмблема' },
-  { t: 5.75, label: 'Название' },
-  { t: 8.35, label: 'Подзаголовок' },
-  { t: 9.55, label: 'Дата' },
-  { t: 10.9, label: 'Блик' },
-];
+const STORE_KEY = 'cinematic.lab.proto-2.config.v1';
 
-const fmt = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+function loadConfig(): Config {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) return sanitizeConfig(JSON.parse(raw));
+  } catch { /* повреждённые данные — используем значения по умолчанию */ }
+  return cloneConfig(DEFAULT_CONFIG);
+}
+
+const fmt = (t: number) => `${t.toFixed(1)}`;
 
 const Icon = ({ d, extra }: { d: string; extra?: React.ReactNode }) => (
   <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -37,10 +40,26 @@ export default function App() {
   const scoreRef = useRef<ScorePlayer | null>(null);
   const timeRef = useRef<HTMLSpanElement>(null);
   const [sound, setSound] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(false);
 
+  const [cfg, setCfgState] = useState<Config>(loadConfig);
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;
+  const [openSettings, setOpenSettings] = useState(false);
+  const [openComp, setOpenComp] = useState(false);
+  const [tab, setTab] = useState<Tab>('layer');
+  const [selected, setSelected] = useState<string>('logo');
+  const [warn, setWarn] = useState<string | null>(null);
+  const panelOpen = openSettings || openComp;
+
+  const setCfg = useCallback((fn: (c: Config) => Config) => setCfgState((c) => fn(c)), []);
+  const setValue = useCallback((path: string, value: any) => setCfgState((c) => setPath(c, path, value)), []);
+
+  /* ------------------------------------------------------------ движок */
   useEffect(() => {
     const host = hostRef.current!;
-    const intro = new Intro(host);
+    const intro = new Intro(host, cfgRef.current);
     introRef.current = intro;
     const score = new ScorePlayer();
     scoreRef.current = score;
@@ -49,16 +68,20 @@ export default function App() {
     intro.onContextLost = () => {
       if (!dead) setError('Видеокарта сбросила WebGL. Обновите страницу или закройте другие вкладки с 3D-графикой.');
     };
+    intro.onWarn = (m) => { if (!dead) setWarn(m); };
+    intro.onLoop = () => score.start(0);
     intro
       .init()
       .then(() => {
         if (dead) return;
         intro.onFrame = (t) => {
           if (barRef.current) barRef.current.style.transform = `scaleX(${Math.min(1, t / intro.duration)})`;
-          if (timeRef.current) timeRef.current.textContent = `${fmt(Math.min(t, intro.duration))} / ${fmt(intro.duration)}`;
+          if (timeRef.current) timeRef.current.textContent = `${fmt(Math.min(t, intro.duration))} / ${fmt(intro.duration)} c`;
         };
         const q = new URLSearchParams(location.search).get('t');
         (window as any).__intro = intro;
+        // для отладки и автотестов: window.__applyConfig({...}) применяет JSON-настройки
+        (window as any).__applyConfig = (raw: any) => setCfgState(sanitizeConfig(raw));
         const time = q === null || q.trim() === '' ? NaN : Number(q);
         if (Number.isFinite(time)) intro.freeze = Math.max(0, Math.min(intro.duration, time));
         else intro.play();
@@ -79,6 +102,26 @@ export default function App() {
     };
   }, []);
 
+  // конфигурация → движок и звук; сохранение в localStorage
+  const resync = useRef<number>(0);
+  useEffect(() => {
+    const intro = introRef.current;
+    if (intro && ready) {
+      intro.setConfig(cfg);
+      const g = cfg.general;
+      const score = scoreRef.current;
+      if (score) {
+        score.setTiming(g.impact, g.speed, totalDuration(cfg), g.volume);
+        window.clearTimeout(resync.current);
+        resync.current = window.setTimeout(() => {
+          if (score.enabled && !pausedRef.current && !recordingRef.current) score.start(introRef.current?.t ?? 0);
+        }, 450);
+      }
+    }
+    const id = window.setTimeout(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(cfg)); } catch { /* квота */ } }, 300);
+    return () => window.clearTimeout(id);
+  }, [cfg, ready]);
+
   useEffect(() => () => { if (video) URL.revokeObjectURL(video.url); }, [video]);
 
   const poke = useCallback(() => {
@@ -87,35 +130,33 @@ export default function App() {
     hideTimer.current = window.setTimeout(() => setUiVisible(false), 2800);
   }, []);
 
-  useEffect(() => {
-    poke();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLElement && (e.target.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON|VIDEO)$/.test(e.target.tagName))) return;
-      poke();
-      if (!recordingRef.current && (e.code === 'Space' || e.key === 'r' || e.key === 'R')) {
-        e.preventDefault();
-        replay();
-      }
-      if (e.key === 'f' || e.key === 'F') toggleFs();
-      if (e.key === 'm' || e.key === 'M' || e.key === 'ь' || e.key === 'Ь') toggleSound();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => { window.removeEventListener('keydown', onKey); window.clearTimeout(hideTimer.current); };
-  }, [poke]);
-
   const replay = useCallback(() => {
+    pausedRef.current = false;
+    setPaused(false);
     introRef.current?.play(0);
     scoreRef.current?.start(0);
   }, []);
 
-  const seekTo = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+  const togglePause = useCallback(() => {
     const intro = introRef.current;
     if (!intro || recordingRef.current) return;
-    const r = e.currentTarget.getBoundingClientRect();
-    const time = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * intro.duration;
-    intro.seek(time);
-    scoreRef.current?.start(time);
+    if (pausedRef.current) {
+      pausedRef.current = false;
+      setPaused(false);
+      intro.play(Math.min(intro.t, intro.duration));
+      scoreRef.current?.start(intro.t);
+    } else {
+      pausedRef.current = true;
+      setPaused(true);
+      intro.freeze = intro.t;
+      scoreRef.current?.stop();
+    }
   }, []);
+
+  const toggleFs = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else rootRef.current?.requestFullscreen?.();
+  };
 
   const toggleSound = useCallback(async () => {
     const score = scoreRef.current;
@@ -127,28 +168,51 @@ export default function App() {
       try {
         await score.enable();
         setSound(true);
-        score.start(introRef.current?.t ?? 0);
+        if (!pausedRef.current) score.start(introRef.current?.t ?? 0);
       } catch (e) {
         console.error(e);
       }
     }
   }, []);
 
-  // браузеры запрещают автозвук: первый клик/касание по сцене включает саундтрек в синхроне с картинкой
+  useEffect(() => {
+    poke();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLElement && (e.target.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON|VIDEO)$/.test(e.target.tagName))) return;
+      poke();
+      if (!recordingRef.current && (e.code === 'Space' || e.key === 'r' || e.key === 'R')) {
+        e.preventDefault();
+        replay();
+      }
+      if (e.key === 'p' || e.key === 'P' || e.key === 'з' || e.key === 'З') togglePause();
+      if (e.key === 'f' || e.key === 'F') toggleFs();
+      if (e.key === 'm' || e.key === 'M' || e.key === 'ь' || e.key === 'Ь') toggleSound();
+      if (e.key === 'Escape') { setOpenSettings(false); setOpenComp(false); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => { window.removeEventListener('keydown', onKey); window.clearTimeout(hideTimer.current); };
+  }, [poke, replay, togglePause, toggleSound]);
+
+  const seekTo = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const intro = introRef.current;
+    if (!intro || recordingRef.current) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const time = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * intro.duration;
+    if (pausedRef.current) { intro.freeze = time; intro.t = time; return; }
+    intro.seek(time);
+    scoreRef.current?.start(time);
+  }, []);
+
+  // браузеры запрещают автозвук: первый клик по сцене включает саундтрек (клики по панелям не считаются)
   useEffect(() => {
     const onFirst = (e: PointerEvent) => {
-      if (e.target instanceof HTMLElement && e.target.closest('button,a,video,[role=slider]')) return;
+      if (e.target instanceof HTMLElement && e.target.closest('button,a,video,input,select,textarea,label,[role=slider],[data-panel]')) return;
       window.removeEventListener('pointerdown', onFirst, true);
       if (!scoreRef.current?.enabled) toggleSound();
     };
     window.addEventListener('pointerdown', onFirst, true);
     return () => window.removeEventListener('pointerdown', onFirst, true);
   }, [toggleSound]);
-
-  const toggleFs = () => {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else rootRef.current?.requestFullscreen?.();
-  };
 
   const record = async () => {
     const intro = introRef.current;
@@ -160,41 +224,55 @@ export default function App() {
     const score = scoreRef.current;
     score?.stop();
     try {
-      const audio = await (score ?? new ScorePlayer()).getBuffer();
+      const g = cfgRef.current.general;
+      score?.setTiming(g.impact, g.speed, totalDuration(cfgRef.current), g.volume);
+      const audio = g.exportAudio ? await (score ?? new ScorePlayer()).getBuffer() : undefined;
       const blob = await intro.record(setProgress, audio);
       const extension = blob.type === 'video/mp4' ? 'mp4' : 'webm';
-      if (!intro.lastExportHadAudio) setRecordError('Видео создано без звука: браузер не поддерживает аудиокодек для экспорта.');
-      setVideo({ url: URL.createObjectURL(blob), name: `yantarny-tsirkul-intro.${extension}` });
+      if (audio && !intro.lastExportHadAudio) setRecordError('Видео создано без звука: браузер не поддерживает аудиокодек для экспорта.');
+      setVideo({ url: URL.createObjectURL(blob), name: `${(g.fileName || 'intro').replace(/[^\w.\-а-яА-ЯёЁ ]+/g, '_')}.${extension}` });
     } catch (e) {
       console.error(e);
       setRecordError(e instanceof Error ? e.message : String(e));
     } finally {
       recordingRef.current = false;
       setRecording(false);
-      score?.start(intro.t);
+      if (!pausedRef.current) score?.start(intro.t);
     }
   };
+
+  /* ------------------------------------------------------------ главы таймлайна (реальное время) */
+  const g = cfg.general;
+  const duration = totalDuration(cfg);
+  const real = (tau: number) => (tau < DESIGN_IMPACT ? (tau * g.impact) / DESIGN_IMPACT : g.impact + (tau - DESIGN_IMPACT) / g.speed);
+  const L = cfg.layers;
+  const chapters = [
+    { t: real(1.05), label: 'Свет' },
+    { t: g.impact, label: 'Эмблема' },
+    { t: real(L.title.start + L.title.delay), label: 'Название' },
+    { t: real(L.subtitle.start + L.subtitle.delay), label: 'Подзаголовок' },
+    { t: real(L.date.start + L.date.delay), label: 'Дата' },
+    { t: real(10.9), label: 'Блик' },
+  ].filter((c) => c.t >= 0 && c.t <= duration);
+  const EW = Math.round(g.width / 2) * 2, EH = Math.round((EW * 9) / 16 / 2) * 2;
+
+  const openLayerSettings = (id: string) => { setSelected(id); setTab('layer'); setOpenSettings(true); };
 
   return (
     <div
       ref={rootRef}
       className="fixed inset-0 bg-black flex items-center justify-center overflow-hidden select-none"
       onPointerMove={poke}
-      style={{ cursor: uiVisible ? 'default' : 'none' }}
+      style={{ cursor: uiVisible || panelOpen ? 'default' : 'none' }}
     >
-      <div
-        className="relative bg-black"
-        style={{ width: 'min(100vw, 177.7778vh)', height: 'min(100vh, 56.25vw)' }}
-      >
+      <div className="relative bg-black" style={{ width: 'min(100vw, 177.7778vh)', height: 'min(100vh, 56.25vw)' }}>
         <div ref={hostRef} className="absolute inset-0" />
 
         {!ready && !error && (
           <div className="absolute inset-0 flex items-center justify-center bg-black">
             <div className="flex flex-col items-center gap-5">
               <div className="w-10 h-10 rounded-full border border-amber-500/20 border-t-amber-300/90 animate-spin" />
-              <div className="text-[11px] tracking-[0.5em] text-amber-200/60 uppercase" style={{ fontFamily: 'Forum, serif' }}>
-                Подготовка сцены
-              </div>
+              <div className="text-[11px] tracking-[0.5em] text-amber-200/60 uppercase" style={{ fontFamily: 'Forum, serif' }}>Подготовка сцены</div>
             </div>
           </div>
         )}
@@ -206,7 +284,7 @@ export default function App() {
 
         {recording && !error && (
           <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-4 bg-black/90 text-amber-100" role="status" aria-live="polite">
-            <div className="text-sm tracking-widest uppercase">Покадровый экспорт 1920 × 1080</div>
+            <div className="text-sm tracking-widest uppercase">Покадровый экспорт {EW} × {EH} · {g.fps} к/с</div>
             <div className="w-64 max-w-[80%] h-1 bg-white/15"><div className="h-full bg-amber-300" style={{ width: `${Math.round(progress * 100)}%` }} /></div>
             <div className="text-xs text-amber-100/70">{progress < 1 ? `${Math.round(progress * 100)}%` : 'Сохранение видео…'}</div>
             <div className="text-xs text-amber-100/50 text-center px-4">Это может занять несколько минут. Не закрывайте вкладку.</div>
@@ -222,6 +300,7 @@ export default function App() {
             </div>
           </div>
         )}
+
         {ready && !error && !video && (
           <>
             {/* таймлайн: клик/перетаскивание = перемотка */}
@@ -232,32 +311,36 @@ export default function App() {
               role="slider"
               aria-label="Позиция в интро"
               aria-valuemin={0}
-              aria-valuemax={Math.round(introRef.current?.duration ?? 13.6)}
+              aria-valuemax={Math.round(duration)}
             >
               <div className="absolute left-0 right-0 bottom-0 h-[2px] group-hover:h-[4px] bg-white/10 transition-all">
-                <div
-                  ref={barRef}
-                  className="h-full origin-left"
-                  style={{ background: 'linear-gradient(90deg, transparent, #d89a3a, #ffe3a0)', transform: 'scaleX(0)' }}
-                />
-                {CHAPTERS.map((c) => (
-                  <div key={c.label} className="absolute bottom-0 h-full w-px bg-amber-200/50" style={{ left: `${(c.t / 13.6) * 100}%` }}>
-                    <span className="absolute bottom-3 -translate-x-1/2 whitespace-nowrap text-[9px] tracking-[0.25em] uppercase text-amber-100/0 group-hover:text-amber-100/70 transition-colors">
-                      {c.label}
-                    </span>
+                <div ref={barRef} className="h-full origin-left" style={{ background: 'linear-gradient(90deg, transparent, #d89a3a, #ffe3a0)', transform: 'scaleX(0)' }} />
+                {chapters.map((c) => (
+                  <div key={c.label} className="absolute bottom-0 h-full w-px bg-amber-200/50" style={{ left: `${(c.t / duration) * 100}%` }}>
+                    <span className="absolute bottom-3 -translate-x-1/2 whitespace-nowrap text-[9px] tracking-[0.25em] uppercase text-amber-100/0 group-hover:text-amber-100/70 transition-colors">{c.label}</span>
                   </div>
                 ))}
               </div>
             </div>
+
+            {/* минималистичные кнопки: композиция и настройки */}
+            <div
+              className="absolute right-4 top-4 z-30 flex items-center gap-2 transition-opacity duration-500"
+              style={{ opacity: uiVisible || panelOpen ? 1 : 0, pointerEvents: uiVisible || panelOpen ? 'auto' : 'none' }}
+            >
+              <RoundBtn label="Композиция: слои" active={openComp} onClick={() => setOpenComp((v) => !v)}><LayersIcon /></RoundBtn>
+              <RoundBtn label="Настройки" active={openSettings} onClick={() => setOpenSettings((v) => !v)}><GearIcon /></RoundBtn>
+            </div>
+
             {!sound && (
               <button
                 onClick={toggleSound}
-                className="absolute top-4 right-4 flex items-center gap-2 px-4 py-2 text-[10px] tracking-[0.3em] uppercase rounded-full border border-amber-300/30 text-amber-100/80 bg-black/40 backdrop-blur-md animate-pulse hover:border-amber-300/70 transition"
+                className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 text-[10px] tracking-[0.3em] uppercase rounded-full border border-amber-300/30 text-amber-100/80 bg-black/40 backdrop-blur-md animate-pulse hover:border-amber-300/70 transition"
               >
                 <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="M15.5 8.5a5 5 0 0 1 0 7" />} /> Включить звук
               </button>
             )}
-            {recordError && <div role="alert" className="absolute top-4 left-4 right-4 text-center text-amber-100 bg-black/80 p-3">{recordError}</div>}
+            {recordError && <div role="alert" className="absolute top-16 left-4 right-4 text-center text-amber-100 bg-black/80 p-3 text-sm">{recordError}</div>}
             <div
               onFocus={() => { window.clearTimeout(hideTimer.current); setUiVisible(true); }}
               onBlur={poke}
@@ -265,30 +348,46 @@ export default function App() {
               style={{ opacity: uiVisible ? 1 : 0, pointerEvents: uiVisible ? 'auto' : 'none' }}
               inert={!uiVisible}
             >
-              <Btn onClick={replay} disabled={recording}>
-                <Icon d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5" /> Повторить
+              <Btn onClick={replay} disabled={recording}><Icon d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5" /> Повторить</Btn>
+              <Btn onClick={togglePause} disabled={recording} active={paused}>
+                {paused ? <Icon d="M7 4v16l13-8z" /> : <Icon d="M8 5v14M16 5v14" />} {paused ? 'Продолжить' : 'Пауза'}
               </Btn>
               <Btn onClick={toggleSound} active={sound}>
-                {sound ? (
-                  <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" />} />
-                ) : (
-                  <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="m22 9-6 6m0-6 6 6" />} />
-                )}
+                {sound ? <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" />} /> : <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="m22 9-6 6m0-6 6 6" />} />}
                 Звук
               </Btn>
               <Btn onClick={record} disabled={recording}>
                 <Icon d="M12 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0" extra={<circle cx="12" cy="12" r="9" />} />
                 {recording ? 'Экспорт…' : 'Создать видео'}
               </Btn>
-              <Btn onClick={toggleFs}>
-                <Icon d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" /> На весь экран
-              </Btn>
+              <Btn onClick={toggleFs}><Icon d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" /> На весь экран</Btn>
               <span ref={timeRef} className="ml-2 tabular-nums text-[10px] tracking-[0.2em] text-amber-100/40" />
             </div>
           </>
         )}
       </div>
+
+      {ready && !error && !video && openComp && (
+        <CompositionPanel cfg={cfg} setCfg={setCfg} selected={selected} onSelect={openLayerSettings} onClose={() => setOpenComp(false)} />
+      )}
+      {ready && !error && !video && openSettings && (
+        <SettingsPanel cfg={cfg} setCfg={setCfg} setValue={setValue} selected={selected} onSelect={setSelected} onClose={() => setOpenSettings(false)} tab={tab} setTab={setTab} warn={warn} />
+      )}
     </div>
+  );
+}
+
+function RoundBtn({ children, label, onClick, active }: { children: React.ReactNode; label: string; onClick: () => void; active?: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-label={label}
+      aria-pressed={active}
+      title={label}
+      className={`grid h-9 w-9 place-items-center rounded-full border backdrop-blur-md transition hover:border-amber-300/70 hover:text-amber-100 ${active ? 'border-amber-300/70 bg-amber-200/15 text-amber-100' : 'border-amber-300/25 bg-black/40 text-amber-100/70'}`}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -305,3 +404,4 @@ function Btn({ children, onClick, disabled, active }: { children: React.ReactNod
     </button>
   );
 }
+

@@ -95,23 +95,23 @@ void main(){
 
 /* ---------------------------------------------------------------- DUST / BOKEH */
 export const dustVert = /* glsl */ `
-uniform float uTime, uScale, uIn, uBokeh;
+uniform float uTime, uScale, uIn, uBokeh, uDens, uSizeK, uSpd;
 attribute vec3 aDir;
 attribute vec4 aP; // size, phase, speed, glint
 varying float vAlpha;
 varying float vGlint;
 varying float vHeat;
 void main(){
-  float f=fract(uTime*aP.z*0.1+aP.y);
+  float f=fract(uTime*uSpd*aP.z*0.1+aP.y);
   vec3 pos=position+aDir*(f-0.5);
   float life=sin(f*3.14159265);
   float tw=0.55+0.45*sin(uTime*(1.2+aP.y*3.)+aP.y*40.);
   float breathe=mix(tw, 0.7+0.3*sin(uTime*0.6+aP.y*20.), uBokeh);
-  vAlpha=life*breathe*uIn;
+  vAlpha=life*breathe*uIn*step(aP.y,uDens);
   vGlint=aP.w*tw;
   vHeat=aP.y;
   vec4 mv=modelViewMatrix*vec4(pos,1.);
-  gl_PointSize=min(aP.x*uScale/-mv.z, 220.);
+  gl_PointSize=min(aP.x*uSizeK*uScale/-mv.z, 220.);
   gl_Position=projectionMatrix*mv;
 }
 `;
@@ -143,7 +143,7 @@ void main(){
 
 /* ---------------------------------------------------------------- ASSEMBLY SWARM */
 export const swarmVert = /* glsl */ `
-uniform float uAssemble, uTime, uScale, uFade;
+uniform float uAssemble, uTime, uScale, uFade, uDens;
 uniform vec2 uCenter;
 attribute vec3 aStart;
 attribute vec3 aTarget;
@@ -163,7 +163,7 @@ void main(){
   float appear=smoothstep(0.,0.06,uAssemble-aR.x*0.5+0.03);
   vHot=(1.-e)*0.8+0.2*step(p,0.999);
   float tw=0.7+0.3*sin(uTime*6.+aR.w*50.);
-  vAlpha=appear*uFade*tw;
+  vAlpha=appear*uFade*tw*step(aR.w,uDens);
   vec4 mv=modelViewMatrix*vec4(pos,1.);
   gl_PointSize=min(aR.z*uScale/-mv.z*(0.8+1.2*(1.-e)), 60.);
   gl_Position=projectionMatrix*mv;
@@ -339,14 +339,16 @@ export const finalPass = {
     uCA: { value: 0 },         // дополнительная хроматическая аберрация
     uPulse: { value: 0 },      // вспышка экспозиции
     uRays: { value: 0 },       // объёмные лучи из эмблемы
+    uVig: { value: 0.62 }, uGrainK: { value: 0.02 }, uSat: { value: 1 }, uCon: { value: 1 }, uHue: { value: 0 }, uShadow: { value: 1 },
   },
   vertexShader: /* glsl */ `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
   fragmentShader: /* glsl */ `
     precision highp float;
     uniform sampler2D tDiffuse;
-    uniform float uTime, uFade, uAspect, uOpen, uLine, uLineI, uBlur, uShock, uShockAmp, uCA, uPulse, uRays;
+    uniform float uTime, uFade, uAspect, uOpen, uLine, uLineI, uBlur, uShock, uShockAmp, uCA, uPulse, uRays, uVig, uGrainK, uSat, uCon, uHue, uShadow;
     uniform vec2 uRes, uShockC;
     varying vec2 vUv;
+    vec3 hueRot(vec3 c,float a){ vec3 k=vec3(0.57735); float ca=cos(a); return c*ca+cross(k,c)*sin(a)+k*dot(k,c)*(1.-ca); }
     float h21(vec2 p){ vec3 p3=fract(vec3(p.xyx)*.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
     void main(){
       vec2 uv=vUv;
@@ -400,15 +402,19 @@ export const finalPass = {
       col*=1.+uPulse;
       // vignette
       float v=smoothstep(0.30,1.05,length(d*vec2(uAspect*0.72,1.15)));
-      col*=1.-v*0.62;
+      col*=1.-v*uVig;
       // warm grade
       col=pow(max(col, vec3(0.)), vec3(0.98,1.0,1.04));
       // холодные тени: сине-зелёный оттенок в чёрном подчёркивает золото
       float lum=dot(col,vec3(.3,.5,.2));
-      col+=vec3(-0.002,0.004,0.011)*(1.-smoothstep(0.0,0.35,lum));
+      col+=vec3(-0.002,0.004,0.011)*uShadow*(1.-smoothstep(0.0,0.35,lum));
+      if(abs(uHue)>0.0005) col=hueRot(col,uHue);
+      float lm2=dot(col,vec3(.3,.5,.2));
+      col=mix(vec3(lm2),col,uSat);
+      col=max((col-0.18)*uCon+0.18,vec3(0.));
       // film grain / dither
       float gr=h21(vUv*uRes+fract(uTime*7.13)*173.)-.5;
-      col+=gr*0.02*(1.-0.4*col);
+      col+=gr*uGrainK*(1.-0.4*col);
       col*=uFade;
 
       // кинематографическая «щель»: кадр раскрывается из линии света

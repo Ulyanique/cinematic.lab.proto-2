@@ -13,32 +13,53 @@ export interface LogoPart {
   center: THREE.Vector3;
   size: THREE.Vector3;
   dir: THREE.Vector3;
-  start: number;
-  dur: number;
 }
 
-/** Build the 3D emblem directly from the supplied vector artwork. */
-export function buildLogoParts(): LogoPart[] {
-  const svg = new SVGLoader().parse(logoSvg);
-  const parts: LogoPart[] = [];
-  // Preserve the source's aspect ratio and the position of the original emblem.
-  const scale = 3.2 / 3937.77;
-  svg.paths.forEach((path, index) => {
+export interface LogoOpts { svg?: string; size: number; depth: number; bevel: number }
+
+/** Build the 3D emblem directly from vector artwork (built-in or user-supplied SVG). */
+export function buildLogoParts(opts: LogoOpts): LogoPart[] {
+  const src = opts.svg && opts.svg.trim().startsWith('<') ? opts.svg : logoSvg;
+  let svg;
+  try {
+    svg = new SVGLoader().parse(src);
+  } catch {
+    svg = new SVGLoader().parse(logoSvg);
+  }
+  const vb = /viewBox\s*=\s*["']\s*([-\d.eE]+)[\s,]+([-\d.eE]+)[\s,]+([-\d.eE]+)[\s,]+([-\d.eE]+)/.exec(src);
+  const raws: { g: THREE.BufferGeometry }[] = [];
+  const depth = opts.depth;
+  svg.paths.forEach((path) => {
     const shapes = path.toShapes();
     if (!shapes.length) return;
-    const raw = new THREE.ExtrudeGeometry(shapes, {
-      depth: 140,
-      bevelEnabled: true,
-      bevelThickness: 22,
-      bevelSize: 18,
+    const g = new THREE.ExtrudeGeometry(shapes, {
+      depth,
+      bevelEnabled: opts.bevel > 0.5,
+      bevelThickness: opts.bevel,
+      bevelSize: opts.bevel * 0.82,
       bevelSegments: 3,
       curveSegments: 16,
     });
-    raw.translate(0, 0, -70);
+    g.translate(0, 0, -depth / 2);
+    raws.push({ g });
+  });
+  if (!raws.length) throw new Error('Не удалось прочитать контуры логотипа SVG');
+
+  // origin/width: viewBox, иначе габариты контуров
+  const all = new THREE.Box3();
+  raws.forEach(({ g }) => { g.computeBoundingBox(); all.union(g.boundingBox!); });
+  const ox = vb ? parseFloat(vb[1]) : all.min.x;
+  const oy = vb ? parseFloat(vb[2]) : all.min.y;
+  const w = vb ? parseFloat(vb[3]) : all.max.x - all.min.x;
+  const scale = opts.size / (w || 1);
+
+  const parts: LogoPart[] = [];
+  raws.forEach(({ g: raw }, index) => {
+    raw.translate(-ox, -oy, 0);
     raw.scale(scale, scale, scale);
     // SVG coordinates point down. A half-turn keeps front-face winding intact.
     raw.rotateX(Math.PI);
-    raw.translate(-3.2 / 2, P(0, 94).y, 0);
+    raw.translate(-opts.size / 2, P(0, 94).y, 0);
     const geometry = toCreasedNormals(raw, 0.55);
     raw.dispose();
     geometry.computeBoundingBox();
@@ -50,10 +71,7 @@ export function buildLogoParts(): LogoPart[] {
       center: bb.getCenter(new THREE.Vector3()),
       size: bb.getSize(new THREE.Vector3()),
       dir: new THREE.Vector3(0, -1, 0),
-      start: 4.2 + index * 0.12,
-      dur: 1.15,
     });
   });
-  if (!parts.length) throw new Error('Не удалось прочитать контуры логотипа SVG');
   return parts;
 }

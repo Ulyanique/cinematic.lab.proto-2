@@ -222,7 +222,49 @@ export async function renderScore(sampleRate = 44100): Promise<AudioBuffer> {
 }
 
 /** Воспроизведение готовой партитуры, синхронное с таймлайном интро. */
+/**
+ * Подгоняет партитуру под настройки времени: удар (4.5 с в оригинале) переносится на `impact`,
+ * дальнейшая музыка проигрывается со скоростью `speed` (с линейной интерполяцией), длина = `duration`.
+ */
+export function conformScore(src: AudioBuffer, impact: number, speed: number, duration: number, volume: number): AudioBuffer {
+  const sr = src.sampleRate;
+  const len = Math.max(1, Math.ceil(duration * sr));
+  const out = new AudioBuffer({ length: len, numberOfChannels: src.numberOfChannels, sampleRate: sr });
+  const gain = volume / 0.75;
+  const fade = Math.min(0.9, duration / 3);
+  for (let c = 0; c < src.numberOfChannels; c++) {
+    const a = src.getChannelData(c), o = out.getChannelData(c);
+    for (let n = 0; n < len; n++) {
+      const T = n / sr;
+      const st = (T < impact ? T + (AUDIO_IMPACT - impact) : AUDIO_IMPACT + (T - impact) * speed) * sr;
+      if (st < 0 || st >= a.length - 1) continue;
+      const i = Math.floor(st), f = st - i;
+      const env = Math.min(1, T / 0.02) * Math.min(1, (duration - T) / fade);
+      o[n] = (a[i] * (1 - f) + a[i + 1] * f) * gain * env;
+    }
+  }
+  return out;
+}
+const AUDIO_IMPACT = 4.5;
+
 export class ScorePlayer {
+  private view: AudioBuffer | null = null;
+  private timing = { impact: 4.5, speed: 1, duration: AUDIO_DURATION, volume: 0.75 };
+
+  /** Обновить тайминг/громкость (буфер пересчитается при следующем запуске). */
+  setTiming(impact: number, speed: number, duration: number, volume: number) {
+    const t = this.timing;
+    if (t.impact === impact && t.speed === speed && t.duration === duration && t.volume === volume) return;
+    this.timing = { impact, speed, duration, volume };
+    this.view = null;
+  }
+
+  private conformed(): AudioBuffer | null {
+    if (!this.buffer) return null;
+    const t = this.timing;
+    return (this.view ??= conformScore(this.buffer, t.impact, t.speed, t.duration, t.volume));
+  }
+
   private ctx: AudioContext | null = null;
   private src: AudioBufferSourceNode | null = null;
   private buffer: AudioBuffer | null = null;
@@ -241,17 +283,18 @@ export class ScorePlayer {
   }
 
   getBuffer(): Promise<AudioBuffer> {
-    if (this.buffer) return Promise.resolve(this.buffer);
+    if (this.buffer) return Promise.resolve(this.conformed()!);
     this.loading ??= renderScore(44100);
-    return this.loading.then((b) => (this.buffer = b));
+    return this.loading.then((b) => { this.buffer = b; return this.conformed()!; });
   }
 
   /** Запустить с позиции `offset` секунд. */
   start(offset = 0) {
     this.stop();
-    if (!this.enabled || !this.ctx || !this.buffer || offset >= this.buffer.duration) return;
+    const buf = this.conformed();
+    if (!this.enabled || !this.ctx || !buf || offset >= buf.duration) return;
     const s = this.ctx.createBufferSource();
-    s.buffer = this.buffer;
+    s.buffer = buf;
     s.connect(this.ctx.destination);
     s.start(0, Math.max(0, offset));
     this.src = s;

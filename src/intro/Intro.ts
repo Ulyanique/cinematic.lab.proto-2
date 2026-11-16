@@ -7,9 +7,9 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { MeshSurfaceSampler } from 'three/examples/jsm/math/MeshSurfaceSampler.js';
-import '@fontsource/forum/cyrillic-400.css';
-import '@fontsource/forum/latin-400.css';
-import prataUrl from '@fontsource/prata/files/prata-cyrillic-400-normal.woff?url';
+import { fontOf, loadFontFace } from './fonts';
+import { DEFAULT_CONFIG, DESIGN_IMPACT, cloneConfig, totalDuration, type Config } from './config';
+import { EASE, logoXf, letterXf } from './anim';
 
 import {
   bgVert, bgFrag, dustVert, dustFrag, swarmVert, swarmFrag, sparkVert, sparkFrag,
@@ -60,7 +60,14 @@ const TL = {
 
 export class Intro {
   host: HTMLElement;
-  duration = 13.6;
+  cfg: Config = cloneConfig(DEFAULT_CONFIG);
+  stackZ = { logo: 0, title: 0 };
+  _v3 = new THREE.Vector3();
+  pending = new Set<string>();
+  sigs: any = null;
+  rebuildTimer: any = 0;
+  onWarn: ((msg: string | null) => void) | null = null;
+  onLoop: (() => void) | null = null;
   onFrame: ((t: number) => void) | null = null;
   onContextLost: (() => void) | null = null;
   freeze: number | null = null;
@@ -79,13 +86,15 @@ export class Intro {
   private qualityCap = 1920;
   private perf = { n: 0, sum: 0, last: 0 };
 
-  constructor(host: HTMLElement) {
+  constructor(host: HTMLElement, cfg?: Config) {
     this.host = host;
+    if (cfg) this.cfg = cfg;
   }
 
   /* ------------------------------------------------------------ init */
   async init() {
-    await document.fonts.load('100px Forum', 'ВЕЧЕР РЕТРОСПЕКТИВА 20 НОЯБРЯ 2026 ГОДА');
+    const LY = this.cfg.layers;
+    await Promise.all([loadFontFace(LY.title.font, LY.title.text), loadFontFace(LY.subtitle.font, LY.subtitle.text), loadFontFace(LY.date.font, LY.date.text)]);
     if (this.disposed) return;
 
     const renderer = (this.renderer = new THREE.WebGLRenderer({
@@ -138,6 +147,8 @@ export class Intro {
     this.ro.observe(this.host);
 
 
+    this.sigs = this.sigOf(this.cfg);
+    this.applyOrder();
     this.warmUp();
     renderer.setAnimationLoop(() => this.frame());
   }
@@ -190,6 +201,7 @@ export class Intro {
     const bg = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.bgMat);
     bg.frustumCulled = false;
     bg.renderOrder = -100;
+    this.bgMesh = bg;
     this.scene.add(bg);
   }
 
@@ -241,8 +253,8 @@ export class Intro {
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     g.setAttribute('aDir', new THREE.Float32BufferAttribute(dir, 3));
     g.setAttribute('aP', new THREE.Float32BufferAttribute(prm, 4));
-    this.dustU = { uIn: { value: 0 }, uBokeh: { value: 0 } };
-    const dust = new THREE.Points(g, this.additive(dustVert, dustFrag, { ...this.U, ...this.dustU }));
+    this.dustU = { uIn: { value: 0 }, uBokeh: { value: 0 }, uDens: { value: 1 }, uSizeK: { value: 1 }, uSpd: { value: 1 } };
+    const dust = this.dustPts = new THREE.Points(g, this.additive(dustVert, dustFrag, { ...this.U, ...this.dustU }));
     dust.frustumCulled = false;
     dust.renderOrder = 5;
     this.scene.add(dust);
@@ -268,8 +280,8 @@ export class Intro {
     bg.setAttribute('position', new THREE.Float32BufferAttribute(bp, 3));
     bg.setAttribute('aDir', new THREE.Float32BufferAttribute(bd, 3));
     bg.setAttribute('aP', new THREE.Float32BufferAttribute(bq, 4));
-    this.bokehU = { uIn: { value: 0 }, uBokeh: { value: 1 } };
-    const bokeh = new THREE.Points(bg, this.additive(dustVert, dustFrag, { ...this.U, ...this.bokehU }));
+    this.bokehU = { uIn: { value: 0 }, uBokeh: { value: 1 }, uDens: { value: 1 }, uSizeK: { value: 1 }, uSpd: { value: 1 } };
+    const bokeh = this.bokehPts = new THREE.Points(bg, this.additive(dustVert, dustFrag, { ...this.U, ...this.bokehU }));
     bokeh.frustumCulled = false;
     bokeh.renderOrder = 4;
     this.scene.add(bokeh);
@@ -299,7 +311,7 @@ export class Intro {
       const m = new THREE.Mesh(geo, mat);
       m.renderOrder = 3;
       group.add(m);
-      this.arcs.push({ mesh: m, t0: 0, t1: 1.5, speed: opts.speed });
+      this.arcs.push({ mesh: m, t0: 0, t1: 1.5, speed: opts.speed, a0: opts.alpha ?? 1 });
       return { group, R, speed: opts.speed };
     };
     const node = (arc, angle, size, t0) => {
@@ -323,10 +335,13 @@ export class Intro {
   }
 
   setupLogo() {
+    const LG = this.cfg.layers.logo;
+    // сначала строим геометрию: при ошибке SVG состояние сцены не затрагивается
+    const parts = buildLogoParts({ svg: LG.svg, size: LG.size, depth: LG.depth, bevel: LG.bevel });
     this.logoRoot = new THREE.Group();
     const inner = (this.logoInner = new THREE.Group());
     this.logoRoot.add(inner);
-    this.logoParts = buildLogoParts();
+    this.logoParts = parts;
 
     const bb = new THREE.Box3();
     this.logoParts.forEach((p) => {
@@ -337,15 +352,21 @@ export class Intro {
     this.logoCenter = C;
     this.logoRoot.position.set(C.x, C.y, 0);
     inner.position.set(-C.x, -C.y, 0);
+    const pr = rng(33);
+    this.logoRand = this.logoParts.map(() => pr());
 
+    // каждая деталь вращается вокруг собственного центра — это нужно пресетам анимации
     this.logoMeshes = this.logoParts.map((p) => {
       const mat = makeGold({ gradBot: -0.1, gradTop: 3.15, env: 1.6 });
       const u = mat.userData.u;
-      u.uCenter.value.copy(p.center);
+      u.uCenter.value.set(0, 0, 0);
       u.uDir.value.copy(p.dir);
       u.uExtent.value = Math.abs(p.dir.x) > 0.5 ? p.size.x : p.size.y;
-      const m = new THREE.Mesh(p.geometry, mat);
-      m.position.z = p.z;
+      const geo = p.geometry.clone();
+      geo.translate(-p.center.x, -p.center.y, -p.center.z);
+      const m = new THREE.Mesh(geo, mat);
+      m.position.copy(p.center);
+      m.position.z += p.z;
       m.visible = false;
       inner.add(m);
       return m;
@@ -379,6 +400,7 @@ export class Intro {
     this.swarmU = {
       uAssemble: { value: 0 },
       uFade: { value: 1 },
+      uDens: { value: 1 },
       uCenter: { value: new THREE.Vector2(C.x, C.y) },
     };
     const sw = new THREE.Points(g, this.additive(swarmVert, swarmFrag, { ...this.U, ...this.swarmU }));
@@ -389,7 +411,8 @@ export class Intro {
     // burst sparks from the logo at the flash moment
     const sp = this.makeSparks();
     const rs = rng(55);
-    for (let k = 0; k < 1100; k++) {
+    const cnt = tgt.length ? LG.sparkCount : 0;
+    for (let k = 0; k < cnt; k++) {
       const i = Math.floor(rs() * (tgt.length / 3));
       const x = tgt[i * 3], y = tgt[i * 3 + 1], z = tgt[i * 3 + 2];
       const dx = x - C.x, dy = y - C.y;
@@ -406,6 +429,7 @@ export class Intro {
   setupCompassRings() {
     const glow = this.glowTex();
     const d2r = Math.PI / 180;
+    const root = new THREE.Group();
     this.compass = [
       { R: 2.08, w: 0.0075, alpha: 1.0, dash: 0, t0: 5.0, t1: 6.9, mirror: 1 },
       { R: 2.3, w: 0.005, alpha: 0.75, dash: 120, t0: 5.3, t1: 7.3, mirror: -1 },
@@ -419,16 +443,19 @@ export class Intro {
       m.scale.x = d.mirror;
       m.position.z = -0.15;
       m.visible = false;
-      this.logoRoot.add(m);
+      root.add(m);
       const head = new THREE.Sprite(new THREE.SpriteMaterial({
         map: glow, color: new THREE.Color(2.6, 1.8, 0.8), blending: THREE.AdditiveBlending,
         depthWrite: false, depthTest: false, transparent: true,
       }));
       head.renderOrder = 6;
       head.visible = false;
-      this.logoRoot.add(head);
+      root.add(head);
       return { m, head, ...d, a0: -15 * d2r, len: 210 * d2r };
     });
+    if (this.compassRoot) this.scene.remove(this.compassRoot);
+    this.compassRoot = root;
+    this.scene.add(root);
   }
 
   makeSparks() {
@@ -439,6 +466,7 @@ export class Intro {
         pos.push(x, y, z); vel.push(vx, vy, vz); life.push(birth, lf); size.push(sz);
       },
       build(parent) {
+        if (!pos.length) return null;
         const g = new THREE.BufferGeometry();
         g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
         g.setAttribute('aVel', new THREE.Float32BufferAttribute(vel, 3));
@@ -454,18 +482,35 @@ export class Intro {
   }
 
   async setupTitle() {
-    const text = 'ЯНТАРНЫЙ ЦИРКУЛЬ';
-    const { letters, capH } = await buildTitle(prataUrl, text, 11.55, 0.045);
-    this.titleGroup = new THREE.Group();
+    const T = this.cfg.layers.title;
+    const F = fontOf(T.font);
+    const { letters, capH } = await buildTitle(F.urls, T.text, T.width, { tracking: T.tracking, depth: T.depth, bevel: T.bevel });
+    if (this.disposed) return;
+    const root = new THREE.Group();
+    const group = new THREE.Group();
     const baseY = -0.66 - capH / 2;
-    this.titleGroup.position.set(0, baseY, 0);
-    this.scene.add(this.titleGroup);
-    this.titleBaseY = baseY;
+    group.position.set(0, baseY, 0);
+    root.add(group);
+
+    // очерёдность появления букв
+    const n = letters.length;
+    const rnd = rng(77);
+    const byCenter = [...Array(n).keys()].sort((a, b) => Math.abs(a - (n - 1) / 2) - Math.abs(b - (n - 1) / 2) || a - b);
+    const rank = new Array(n);
+    if (T.order === 'rtl') for (let i = 0; i < n; i++) rank[i] = n - 1 - i;
+    else if (T.order === 'center') byCenter.forEach((idx, j) => (rank[idx] = j));
+    else if (T.order === 'edges') byCenter.forEach((idx, j) => (rank[idx] = n - 1 - j));
+    else if (T.order === 'random') {
+      const sh = [...Array(n).keys()];
+      for (let i = n - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [sh[i], sh[j]] = [sh[j], sh[i]]; }
+      sh.forEach((idx, j) => (rank[idx] = j));
+    } else for (let i = 0; i < n; i++) rank[i] = i;
+
     const sp = this.makeSparks();
     const r = rng(99);
-    this.letterMeshes = letters.map((L, i) => {
+    const meshes = letters.map((L, i) => {
       L.geometry.translate(-L.center.x, -L.center.y, -L.center.z);
-      const mat = makeGold({ gradBot: -1.15, gradTop: -0.1, env: 1.55, roughness: 0.25 });
+      const mat = makeGold({ gradBot: -1.15, gradTop: -0.1, env: T.env, roughness: T.roughness });
       const u = mat.userData.u;
       u.uCenter.value.set(0, 0, 0);
       u.uDir.value.set(0, -1, 0);
@@ -473,33 +518,51 @@ export class Intro {
       const m = new THREE.Mesh(L.geometry, mat);
       m.position.copy(L.center);
       m.visible = false;
-      this.titleGroup.add(m);
-      const start = TL.letters0 + i * TL.letterStep;
-      const land = start + TL.letterDur * 0.78;
-      // landing sparks
-      for (let k = 0; k < 70; k++) {
+      group.add(m);
+      const start = T.start + rank[i] * T.stagger;
+      const land = start + T.duration * 0.78;
+      for (let k = 0; k < T.sparkCount; k++) {
         sp.add(L.center.x + (r() - 0.5) * L.size.x, L.center.y + baseY + (r() - 0.5) * L.size.y, 0.15, (r() - 0.5) * 1.8, 0.2 + r() * 1.8, (r() - 0.3) * 1.2, land, 0.7 + r() * 1.3, 0.02 + r() * r() * 0.07);
       }
-      return { mesh: m, start, land, L, i, seed: i % 2 ? 1 : -1 };
+      return { mesh: m, start, land, L, i, seed: i % 2 ? 1 : -1, r: rnd() };
     });
     // final-sweep sparks along the title
-    const half = 5.8;
-    for (let k = 0; k < 420; k++) {
+    const half = Math.max(1, T.width / 2);
+    for (let k = 0; k < (T.sparkCount > 0 ? 420 : 0); k++) {
       const x = (r() - 0.5) * 2 * half;
       const t0 = TL.sweep2 + ((x + 9) / 18) * 1.7 * 0.9;
       sp.add(x, -0.2 + (r() - 0.5) * 1.1, 0.2, (r() - 0.5) * 0.8, 0.3 + r() * 1.3, (r() - 0.3) * 0.8, t0, 0.8 + r() * 1.4, 0.02 + r() * r() * 0.06);
     }
-    sp.build(this.scene);
+    sp.build(root);
+
+    // атомарная подмена: кадр никогда не видит «полусобранное» название
+    if (this.titleRoot) { this.scene.remove(this.titleRoot); this.disposeTree(this.titleRoot); }
+    this.titleRoot = root;
+    this.titleGroup = group;
+    this.titleBaseY = baseY;
+    this.letterMeshes = meshes;
+    this.scene.add(root);
   }
 
-  makeTextTexture(text, px, trackEm) {
+  disposeTree(obj) {
+    obj.traverse((o) => {
+      if (o.geometry && !o.isSprite) o.geometry.dispose();
+      const list = Array.isArray(o.material) ? o.material : [o.material];
+      list.filter(Boolean).forEach((m) => {
+        Object.values(m.uniforms || {}).forEach((u) => { if (u?.value?.isTexture && u.value !== this._glow) u.value.dispose(); });
+        m.dispose();
+      });
+    });
+  }
+
+  makeTextTexture(text, px, trackEm, fontDef) {
     const cvs = document.createElement('canvas');
     const ctx = cvs.getContext('2d');
-    const font = `${px}px Forum`;
+    const font = `${fontDef.weight} ${px}px "${fontDef.family}"`;
     ctx.font = font;
     const ws = [...text].map((c) => ctx.measureText(c).width);
     const track = px * trackEm;
-    const total = ws.reduce((a, b) => a + b, 0) + track * (ws.length - 1);
+    const total = Math.max(1, ws.reduce((a, b) => a + b, 0) + track * (ws.length - 1));
     const pad = px * 0.7;
     cvs.width = Math.ceil(total + pad * 2);
     cvs.height = Math.ceil(px * 1.7);
@@ -520,8 +583,8 @@ export class Intro {
     return { tex, w: cvs.width, h: cvs.height, total, pad };
   }
 
-  textPlane(text, px, trackEm, worldTextWidth, yWorld, colA, colB, bright) {
-    const { tex, w, h, total } = this.makeTextTexture(text, px, trackEm);
+  textPlane(text, px, trackEm, worldTextWidth, yWorld, bright, fontDef) {
+    const { tex, w, h, total } = this.makeTextTexture(text, px, trackEm, fontDef);
     const k = worldTextWidth / total;
     const mat = new THREE.ShaderMaterial({
       vertexShader: textVert,
@@ -534,23 +597,34 @@ export class Intro {
         uTime: this.U.uTime,
         uShine: { value: 0.5 },
         uBright: { value: bright },
-        uColA: { value: new THREE.Color(...colA) },
-        uColB: { value: new THREE.Color(...colB) },
+        uColA: { value: new THREE.Color(0.8, 0.5, 0.18) },
+        uColB: { value: new THREE.Color(1, 0.86, 0.55) },
       },
     });
     const m = new THREE.Mesh(new THREE.PlaneGeometry(w * k, h * k), mat);
     // baseline sits at 1.18 / 1.7 of canvas height; shift so caps are centred on yWorld
     const capCenter = (1.18 - 0.35) / 1.7; // approx cap-centre from the top
     m.position.set(0, yWorld + (capCenter - 0.5) * h * k, 0.1);
+    m.userData.baseY = m.position.y;
     m.renderOrder = 9;
     m.visible = false;
     this.scene.add(m);
     return m;
   }
 
+  buildText(kind) {
+    const L = this.cfg.layers[kind === 'sub' ? 'subtitle' : 'date'];
+    const px = kind === 'sub' ? 120 : 100;
+    const yW = kind === 'sub' ? P(0, 537).y : P(0, 597).y;
+    const m = this.textPlane(L.text || ' ', px, L.tracking, L.width, yW, L.brightness, fontOf(L.font));
+    const old = this[kind];
+    if (old) { this.scene.remove(old); this.disposeTree(old); }
+    this[kind] = m;
+  }
+
   setupSubtitle() {
-    this.sub = this.textPlane('ВЕЧЕР РЕТРОСПЕКТИВА', 120, 0.42, 7.25, P(0, 537).y, [0.8, 0.5, 0.18], [1.0, 0.86, 0.55], 1.45);
-    this.date = this.textPlane('20 НОЯБРЯ 2026 ГОДА', 100, 0.3, 4.45, P(0, 597).y, [0.8, 0.52, 0.2], [1.0, 0.88, 0.6], 1.35);
+    this.buildText('sub');
+    this.buildText('date');
   }
 
   setupDividers() {
@@ -565,6 +639,8 @@ export class Intro {
       });
       const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
       m.position.set(cx, y, 0.05);
+      m.userData.baseY = y;
+      m.userData.line = { inner: cx + (dir * w) / 2, w, dir };
       m.renderOrder = 9;
       m.visible = false;
       this.scene.add(m);
@@ -580,6 +656,7 @@ export class Intro {
       const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(2.4, 1.7, 0.8), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
       const m = new THREE.Mesh(new THREE.ShapeGeometry(sh), mat);
       m.position.set(x, y, 0.08);
+      m.userData.baseY = y;
       m.renderOrder = 10;
       m.visible = false;
       this.scene.add(m);
@@ -743,7 +820,8 @@ export class Intro {
     const pr = Math.min(window.devicePixelRatio || 1, 2);
     let W = w ?? Math.round(this.host.clientWidth * pr);
     let H = h ?? Math.round(this.host.clientHeight * pr);
-    if (!this.forced && W > this.qualityCap) { H = Math.round((H * this.qualityCap) / W); W = this.qualityCap; }
+    const cap = Math.min(this.qualityCap, this.cfg.general.quality);
+    if (!this.forced && W > cap) { H = Math.round((H * cap) / W); W = cap; }
     W = Math.max(W, 320); H = Math.max(H, 180);
     this.pxW = W; this.pxH = H;
     this.renderer.setPixelRatio(1);
@@ -758,6 +836,80 @@ export class Intro {
     this.fp.uniforms.uRes.value = [W, H];
     this.fp.uniforms.uAspect.value = W / H;
     this.bloom.resolution.set(W, H);
+  }
+
+  /* ------------------------------------------------------------ config */
+  get duration() { return totalDuration(this.cfg); }
+
+  sigOf(c: Config) {
+    const L = c.layers, pick = (o, ks) => JSON.stringify(ks.map((k) => o[k]));
+    return {
+      logo: pick(L.logo, ['svg', 'size', 'depth', 'bevel', 'sparkCount']),
+      title: pick(L.title, ['text', 'font', 'width', 'tracking', 'depth', 'bevel', 'start', 'stagger', 'duration', 'order', 'sparkCount']),
+      sub: pick(L.subtitle, ['text', 'font', 'width', 'tracking']),
+      date: pick(L.date, ['text', 'font', 'width', 'tracking']),
+    };
+  }
+
+  /** Применить новую конфигурацию. Параметры «на лету» подхватываются в update(); структурные — пересобирают слой. */
+  setConfig(cfg: Config) {
+    this.cfg = cfg;
+    if (!this.scene || !this.sigs) return;
+    this.applyOrder();
+    if (!this.forced) this.applySize();
+    const sig = this.sigOf(cfg);
+    for (const k of Object.keys(sig)) if (sig[k] !== this.sigs[k]) this.pending.add(k);
+    if (!this.pending.size) return;
+    clearTimeout(this.rebuildTimer);
+    this.rebuildTimer = setTimeout(() => this.runRebuild(), 280);
+  }
+
+  async runRebuild() {
+    if (this.disposed) return;
+    if (this.forced) { this.rebuildTimer = setTimeout(() => this.runRebuild(), 500); return; }
+    const list = [...this.pending];
+    this.pending.clear();
+    const L = this.cfg.layers;
+    const sig = this.sigOf(this.cfg);
+    try {
+      await Promise.all([loadFontFace(L.title.font, L.title.text), loadFontFace(L.subtitle.font, L.subtitle.text), loadFontFace(L.date.font, L.date.text)]);
+      if (list.includes('logo')) {
+        const oldLogo = this.logoRoot;
+        this.setupLogo();
+        this.setupCompassRings();
+        this.scene.remove(oldLogo);
+        this.disposeTree(oldLogo);
+      }
+      if (list.includes('title')) await this.setupTitle();
+      if (list.includes('sub')) this.buildText('sub');
+      if (list.includes('date')) this.buildText('date');
+      this.sigs = sig;
+      this.applyOrder();
+      this.onWarn?.(null);
+    } catch (e) {
+      console.error(e);
+      // не пытаемся пересобирать то же самое снова, пока пользователь не изменит параметры
+      this.sigs = sig;
+      this.onWarn?.(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Порядок слоёв: чем выше в списке, тем ближе к зрителю (renderOrder для светящихся, глубина для золота). */
+  applyOrder() {
+    const order = this.cfg.order, N = order.length;
+    const band = (id) => 10 + (N - 1 - order.indexOf(id)) * 10;
+    const setRO = (list, id) => list.filter(Boolean).forEach((o, j) => { o.renderOrder = band(id) + Math.min(j, 9); });
+    setRO([...this.arcs.map((a) => a.mesh), ...this.dots.map((d) => d.s)], 'rings');
+    setRO(this.logoInner.children.filter((o) => o.isPoints), 'logo');
+    setRO([...this.compass.map((c) => c.m), ...this.compass.map((c) => c.head)], 'compass');
+    setRO([this.bokehPts, this.dustPts], 'particles');
+    setRO(this.titleRoot.children.filter((o) => o.isPoints), 'title');
+    setRO([this.sub], 'subtitle');
+    setRO([this.date], 'date');
+    setRO([this.div1.L, this.div1.R, this.div1.d, this.div2.L, this.div2.R, this.div2.d], 'dividers');
+    setRO([this.coreGlow, ...this.glints.map((g) => g.s), this.flareLogo.s, this.flareTitle.s, this.flareSub.s, this.waveLogo, this.waveTitle], 'fx');
+    const il = order.indexOf('logo'), it = order.indexOf('title');
+    this.stackZ = { logo: il < it ? 0.3 : 0, title: it < il ? 0.3 : 0 };
   }
 
   /* ------------------------------------------------------------ playback */
@@ -788,23 +940,24 @@ export class Intro {
     const previousTime = this.t;
     const previousFreeze = this.freeze;
     const wasPlaying = this.playing;
-    const fps = 30;
+    const fps = this.cfg.general.fps;
     try {
-      const options = { width: 1920, height: 1080, bitrate: 16_000_000, frameRate: fps };
+      const EW = Math.round(this.cfg.general.width / 2) * 2, EH = Math.round((EW * 9) / 16 / 2) * 2;
+      const options = { width: EW, height: EH, bitrate: this.cfg.general.bitrate * 1_000_000, frameRate: fps };
       const codec = await canEncodeVideo('avc', options) ? 'avc'
         : await canEncodeVideo('vp9', options) ? 'vp9'
         : await canEncodeVideo('vp8', options) ? 'vp8' : null;
       if (cancelled || this.disposed) throw new Error('Экспорт отменён');
-      if (!codec) throw new Error('Нет доступного кодировщика видео 1920×1080. Попробуйте Chrome или Edge.');
+      if (!codec) throw new Error(`Нет доступного кодировщика видео ${EW}×${EH}. Выберите меньшее разрешение или попробуйте Chrome/Edge.`);
       this.renderer.setAnimationLoop(null);
-      this.applySize(1920, 1080);
+      this.applySize(EW, EH);
       const target = new BufferTarget();
       output = new Output({ format: codec === 'avc' ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
       const source = new CanvasSource(this.renderer.domElement, { codec, bitrate: options.bitrate });
       output.addVideoTrack(source, { frameRate: fps });
       let audioDone: Promise<void> | null = null;
       let aSource: AudioBufferSource | undefined;
-      if (audio) {
+      if (audio && this.cfg.general.exportAudio) {
         // лучший доступный кодек, который умеет контейнер (MP4: AAC/Opus…, WebM: Opus/Vorbis)
         const aOpts = { numberOfChannels: audio.numberOfChannels, sampleRate: audio.sampleRate, bitrate: 192_000 };
         const aCodec = await getFirstEncodableAudioCodec(output.format.getSupportedAudioCodecs(), aOpts).catch(() => null);
@@ -883,35 +1036,66 @@ export class Intro {
       if (this.anchorPending) { this.startAt = performance.now() - this.anchor * 1000; this.anchorPending = false; }
       this.t = (performance.now() - this.startAt) / 1000;
     }
+    if (this.playing && this.freeze === null && this.cfg.general.loop && this.t > this.duration + 0.4) {
+      this.onLoop?.();
+      this.play(0);
+      this.t = 0;
+    }
     this.update(this.t);
     this.composer.render();
     this.onFrame?.(this.t);
   }
 
   /* ------------------------------------------------------------ the timeline */
-  update(t: number) {
+  warp(real: number) {
+    const g = this.cfg.general;
+    return real < g.impact ? real * (DESIGN_IMPACT / g.impact) : DESIGN_IMPACT + (real - g.impact) * g.speed;
+  }
+
+  update(real: number) {
+    this.updateDesign(this.warp(real), real);
+  }
+
+  setCol(c, hex) {
+    if (c.__h !== hex) { c.set(hex); c.__h = hex; }
+  }
+
+  /** t — «проектное» время (удар всегда в 4.5 с), real — реальное время ролика. */
+  updateDesign(t: number, real: number) {
+    const C = this.cfg, G = C.general, CM = C.camera, PO = C.post, LY = C.layers;
+    const BG = LY.background, LG = LY.logo, CP = LY.compass, TT = LY.title, SB = LY.subtitle, DT = LY.date;
+    const DV = LY.dividers, RG = LY.rings, PT = LY.particles, FX = LY.fx;
+    const lt = (id: string) => t - LY[id].delay;
+    const fxk = (v: number) => (FX.enabled ? v : 0);
+    const d2r = Math.PI / 180;
+
     this.U.uTime.value = t;
     sharedGold.uTime.value = t;
+    this.renderer.toneMappingExposure = PO.exposure;
+    if (this.camera.fov !== CM.fov) {
+      this.camera.fov = CM.fov;
+      this.camera.updateProjectionMatrix();
+      this.U.uScale.value = this.pxH / (2 * Math.tan((CM.fov * Math.PI) / 360));
+    }
 
     // camera: a slow cinematic push with parallax
     const ck = easeInOutSine(seg(t, 0, 12.5));
-    const sway = 1;
     this.camera.position.set(
-      (1 - ck) * -1.6 + Math.sin(t * 0.33) * 0.1 * sway,
-      (1 - ck) * 0.8 + Math.cos(t * 0.27) * 0.06 * sway,
-      16.8 + (1 - ck) * 4.6
+      (1 - ck) * CM.startX + Math.sin(t * 0.33) * 0.1 * CM.sway,
+      (1 - ck) * CM.startY + Math.cos(t * 0.27) * 0.06 * CM.sway,
+      CM.distance + (1 - ck) * CM.push
     );
     // удар в момент появления эмблемы: короткий «толчок» камеры и дрожь
     const punch = burst(t, 4.5, 0.045, 0.55);
-    const shake = burst(t, 4.5, 0.02, 0.22);
+    const shake = burst(t, 4.5, 0.02, 0.22) * CM.shake;
     // «замах»: кадр чуть отъезжает и темнеет перед ударом, затем резко бьёт вперёд
     const windup = easeInOutSine(seg(t, 3.85, 4.5)) * (t < 4.5 ? 1 : 0);
-    this.camera.position.z += windup * 0.38;
-    this.camera.position.z -= punch * 0.75;
+    this.camera.position.z += windup * CM.windup;
+    this.camera.position.z -= punch * CM.punch;
     this.camera.position.x += Math.sin(t * 83) * 0.045 * shake;
     this.camera.position.y += Math.cos(t * 71) * 0.035 * shake;
     this.camera.lookAt(0, 0, 0);
-    this.camera.rotation.z += (1 - ck) * 0.025 + Math.sin(t * 59) * 0.004 * shake;
+    this.camera.rotation.z += (1 - ck) * CM.roll + Math.sin(t * 59) * 0.004 * shake;
     this.bgMat.uniforms.uCam.value.set(this.camera.position.x * -0.25, this.camera.position.y * -0.25);
 
     // global fade-in
@@ -919,27 +1103,37 @@ export class Intro {
     const F = this.fp.uniforms;
     const dip = 0.3 * easeInOutSine(seg(t, 4.1, 4.48)) * (t < 4.5 ? 1 : 0);
     // в экспортируемом видео картинка уходит в чёрный вместе со звуком
-    const fadeOut = this.forced ? 1 - easeInOutSine(seg(t, 13.0, 13.6)) : 1;
+    const dur = this.duration;
+    const fadeOut = this.forced && G.fadeOut ? 1 - easeInOutSine(seg(real, dur - 0.6, dur)) : 1;
     F.uFade.value = fadeIn * (1 - dip) * fadeOut;
     F.uTime.value = t;
+    F.uVig.value = PO.vignette;
+    F.uGrainK.value = PO.grain;
+    F.uSat.value = PO.saturation;
+    F.uCon.value = PO.contrast;
+    F.uHue.value = PO.hue * d2r;
+    F.uShadow.value = PO.shadowTint;
 
     // ПРОЛОГ: искра → линия света → «щель» раскрывается в cinemascope → удар раскрывает кадр целиком
+    const ign = PO.ignition ? 1 : 0;
     const lineGrow = 1 - Math.pow(1 - seg(t, 0.25, 1.55), 4);
-    F.uLine.value = lineGrow * 1.25;
+    F.uLine.value = lineGrow * 1.25 * ign;
     const spark = burst(t, 0.2, 0.35, 0.9);
-    F.uLineI.value = (0.25 + 0.75 * easeOutCubic(seg(t, 0.2, 1.0)) + 0.5 * spark) * (1 - easeInOutSine(seg(t, 1.9, 3.1))) + 0.0;
-    const open1 = easeInOutCubic(seg(t, 1.05, 2.75)) * 0.372;
-    const open2 = (1 - Math.pow(1 - seg(t, 4.46, 5.2), 4)) * (0.62 - 0.372);
-    F.uOpen.value = t < 4.46 ? open1 : 0.372 + open2;
+    F.uLineI.value = (0.25 + 0.75 * easeOutCubic(seg(t, 0.2, 1.0)) + 0.5 * spark) * (1 - easeInOutSine(seg(t, 1.9, 3.1))) * ign;
+    const so = PO.slitSize;
+    const open1 = easeInOutCubic(seg(t, 1.05, 2.75)) * so;
+    const open2 = (1 - Math.pow(1 - seg(t, 4.46, 5.2), 4)) * (0.62 - so);
+    F.uOpen.value = !PO.slit ? 1 : t < 4.46 ? open1 : so + open2;
     // фокус-пулл: из мягкого боке в резкость, на ударе — короткий «вдох» расфокуса
-    F.uBlur.value = 0.014 * (1 - easeInOutSine(seg(t, 1.1, 4.4))) + 0.0045 * burst(t, 4.5, 0.03, 0.18);
+    F.uBlur.value = (0.014 * (1 - easeInOutSine(seg(t, 1.1, 4.4))) + 0.0045 * burst(t, 4.5, 0.03, 0.18)) * PO.focus;
     // ударная волна и хроматика
     const shk = seg(t, 4.5, 6.4);
     F.uShock.value = easeOutCubic(shk) * 1.15;
-    F.uShockAmp.value = t < 4.5 ? 0 : Math.pow(1 - shk, 1.6);
-    F.uCA.value = burst(t, 4.5, 0.04, 0.45) * 0.9;
-    F.uPulse.value = burst(t, 4.5, 0.03, 0.2) * 0.05;
-    const lp = this.logoCenter.clone().project(this.camera);
+    F.uShockAmp.value = (t < 4.5 ? 0 : Math.pow(1 - shk, 1.6)) * fxk(FX.shock);
+    F.uCA.value = burst(t, 4.5, 0.04, 0.45) * 0.9 * PO.aberration;
+    F.uPulse.value = burst(t, 4.5, 0.03, 0.2) * 0.05 * fxk(FX.flash);
+    const lcx = this.logoCenter.x + LG.x, lcy = this.logoCenter.y + LG.y;
+    const lp = this._v3.set(lcx, lcy, 0).project(this.camera);
     F.uShockC.value = [lp.x * 0.5 + 0.5, lp.y * 0.5 + 0.5];
 
     // environment drifts so reflections glide over the metal
@@ -949,165 +1143,223 @@ export class Intro {
 
     // background light
     const bu = this.bgMat.uniforms;
-    bu.uBeam.value = easeOutCubic(seg(t, 0.4, 3.4)) * (0.92 + 0.08 * Math.sin(t * 0.7)) * (1 + 0.15 * burst(t, 4.5, 0.1, 0.8));
-    bu.uRib.value = easeOutCubic(seg(t, 1.0, 4.0)) * (0.9 + 0.1 * Math.sin(t * 0.9 + 1));
-    bu.uGlow.value = easeOutCubic(seg(t, 3.5, 6.5));
-    bu.uFlash.value = burst(t, 4.5, 0.06, 0.5) * 0.11 + burst(t, TL.sweep2, 0.3, 0.7) * 0.15;
-    bu.uFinal.value = easeOutCubic(seg(t, 7.5, 10.5));
+    this.bgMesh.visible = BG.enabled;
+    const bt = lt('background');
+    bu.uBeam.value = easeOutCubic(seg(bt, 0.4, 3.4)) * (0.92 + 0.08 * Math.sin(t * 0.7)) * (1 + 0.15 * burst(t, 4.5, 0.1, 0.8)) * BG.beam;
+    bu.uRib.value = easeOutCubic(seg(bt, 1.0, 4.0)) * (0.9 + 0.1 * Math.sin(t * 0.9 + 1)) * BG.ribbons;
+    bu.uGlow.value = easeOutCubic(seg(bt, 3.5, 6.5)) * BG.glow;
+    bu.uFlash.value = (burst(t, 4.5, 0.06, 0.5) * 0.08 + burst(t, TL.sweep2, 0.3, 0.7) * 0.15) * fxk(FX.flash);
+    bu.uFinal.value = easeOutCubic(seg(bt, 7.5, 10.5)) * BG.final;
 
     // particles
-    this.dustU.uIn.value = easeOutCubic(seg(t, 0.2, 2.5));
-    this.bokehU.uIn.value = easeOutCubic(seg(t, 0.6, 3.5));
+    const pt = lt('particles');
+    this.dustPts.visible = this.bokehPts.visible = PT.enabled;
+    this.dustU.uIn.value = easeOutCubic(seg(pt, 0.2, 2.5)) * PT.brightness;
+    this.bokehU.uIn.value = easeOutCubic(seg(pt, 0.6, 3.5)) * PT.brightness;
+    this.dustU.uDens.value = PT.dust;
+    this.bokehU.uDens.value = PT.bokeh;
+    this.dustU.uSizeK.value = this.bokehU.uSizeK.value = PT.size;
+    this.dustU.uSpd.value = this.bokehU.uSpd.value = PT.speed;
 
     // Keep the ring centres at the viewport corners at every camera position.
     const cornerY = 10 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
     const cornerX = cornerY * this.camera.aspect;
     this.cornerRings[0].position.set(-cornerX, cornerY, -10);
     this.cornerRings[1].position.set(cornerX, -cornerY, -10);
+    this.cornerRings.forEach((g) => { g.visible = RG.enabled; g.scale.setScalar(RG.scale); });
 
     // arcs
-    this.arcs.forEach(({ mesh, t0, t1, speed }) => {
-      mesh.rotation.z = t * speed;
-      mesh.material.uniforms.uProg.value = easeInOutSine(seg(t, t0, t1));
+    const rt = lt('rings');
+    this.arcs.forEach(({ mesh, t0, t1, speed, a0 }) => {
+      mesh.rotation.z = t * speed * RG.speed;
+      mesh.material.uniforms.uProg.value = easeInOutSine(seg(rt, t0, t1));
+      mesh.material.uniforms.uAlpha.value = a0 * RG.opacity;
     });
     this.dots.forEach(({ s, size, t0, R, angle, speed }) => {
-      const a = angle + t * speed;
+      const a = angle + t * speed * RG.speed;
       s.position.set(Math.cos(a) * R, Math.sin(a) * R, 0);
-      const k = easeOutBack(seg(t, t0, t0 + 0.7));
+      const k = easeOutBack(seg(rt, t0, t0 + 0.7));
       const pulse = 1 + 0.25 * Math.sin(t * 2.4 + t0 * 5);
-      const sc = Math.max(0, k) * size * pulse * (1 + burst(t, 4.55, 0.1, 0.6) * 0.8);
+      const sc = Math.max(0, k) * size * pulse * (1 + burst(t, 4.55, 0.1, 0.6) * 0.8) * (RG.nodes ? RG.opacity : 0);
       s.scale.set(sc, sc, 1);
       s.visible = sc > 0.001;
     });
 
-    // дуги циркуля вокруг эмблемы
+    // logo swarm assembly
+    const gt = lt('logo');
+    const isSwarm = LG.preset === 'swarm';
+    this.swarmU.uAssemble.value = easeInOutSine(seg(gt, 1.6, 4.55));
+    // на ударе рой кратко приглушаем (иначе 18 000 аддитивных точек выжигают силуэт) и быстрее растворяем
+    this.swarmU.uFade.value = isSwarm ? easeOutCubic(seg(gt, 1.5, 2.4)) * (1 - 0.75 * burst(t, 4.5, 0.03, 0.22)) * (1 - easeInOutSine(seg(gt, 4.5, 4.95))) : 0;
+    this.swarmU.uDens.value = LG.swarm;
+    this.logoRoot.visible = LG.enabled;
+    const rot = LG.tilt * (1 - easeInOutCubic(seg(gt, 1.4, 8.0)));
+    this.logoRoot.rotation.y = rot + Math.sin(t * 0.5) * 0.015 * LG.float;
+    this.logoRoot.rotation.x = Math.sin(t * 0.4) * 0.012 * LG.float;
+    this.logoRoot.position.set(lcx, lcy + Math.sin(t * 0.7) * 0.025 * LG.float, this.stackZ.logo);
+    this.logoRoot.scale.setScalar(LG.scale * (1 + 0.04 * (1 - easeOutCubic(seg(gt, 4.2, 8)))));
+
+    const n = this.logoParts.length;
+    const ease = EASE[LG.easing] || EASE.cubic;
+    this.logoParts.forEach((p, i) => {
+      const m = this.logoMeshes[i];
+      const t0 = 4.5 - LG.lead + i * LG.stagger;
+      const k = seg(gt, t0, t0 + LG.duration);
+      const xf = logoXf(LG.preset, k, {
+        vx: p.center.x - this.logoCenter.x, vy: p.center.y - this.logoCenter.y, i, n, r: this.logoRand[i],
+        a: LG.intensity, ang: LG.angle * d2r, turns: LG.turns, ease,
+      });
+      m.position.set(p.center.x + xf.x, p.center.y + xf.y, p.center.z + p.z + xf.z);
+      m.rotation.set(xf.rx, xf.ry, xf.rz);
+      m.scale.setScalar(Math.max(1e-4, xf.s));
+      const u = m.material.userData.u;
+      u.uReveal.value = xf.reveal;
+      m.visible = k > 0.0001;
+      u.uFlash.value = (burst(t, 4.52, 0.05, 0.5) * 0.24 + burst(gt, t0 + LG.duration * 0.9, 0.05, 0.4) * 0.3) * LG.flash;
+      this.setCol(u.uGD.value, LG.deep); this.setCol(u.uGM.value, LG.mid); this.setCol(u.uGT.value, LG.top);
+      u.uGradY.value.set(-0.1 + LG.y, 3.15 + LG.y);
+      m.material.roughness = LG.roughness;
+      m.material.envMapIntensity = LG.env;
+    });
+
+    // дуги циркуля вокруг эмблемы (повторяют трансформацию эмблемы)
+    const ct = lt('compass');
+    this.compassRoot.visible = CP.enabled;
+    this.compassRoot.position.copy(this.logoRoot.position);
+    this.compassRoot.rotation.copy(this.logoRoot.rotation);
+    this.compassRoot.scale.copy(this.logoRoot.scale);
     this.compass.forEach((c) => {
-      const k = seg(t, c.t0, c.t1);
+      const t1 = c.t0 + (c.t1 - c.t0) / CP.speed;
+      const k = seg(ct, c.t0, t1);
       const e = easeInOutCubic(k);
       c.m.visible = k > 0;
+      c.m.scale.set(c.mirror * CP.radius, CP.radius, 1);
       c.m.material.uniforms.uProg.value = e;
-      c.m.material.uniforms.uAlpha.value = c.alpha * (1 - 0.45 * easeInOutSine(seg(t, 7.6, 9.4)));
+      c.m.material.uniforms.uW.value = c.w * CP.thickness;
+      c.m.material.uniforms.uAlpha.value = c.alpha * CP.opacity * (1 - 0.45 * easeInOutSine(seg(ct, 7.6, 9.4)));
       const a = c.a0 + c.len * e;
-      c.head.position.set(Math.cos(a) * c.R * c.mirror, Math.sin(a) * c.R, -0.1);
-      const ping = burst(t, c.t1, 0.05, 0.35);
-      const hs = (k > 0 && k < 1 ? 0.3 : 0) + ping * 0.6;
+      c.head.position.set(Math.cos(a) * c.R * c.mirror * CP.radius, Math.sin(a) * c.R * CP.radius, -0.1);
+      const ping = burst(ct, t1, 0.05, 0.35);
+      const hs = ((k > 0 && k < 1 ? 0.3 : 0) + ping * 0.6) * CP.head;
       c.head.scale.set(hs, hs, 1);
       c.head.visible = hs > 0.01;
     });
 
-    // logo swarm assembly
-    this.swarmU.uAssemble.value = easeInOutSine(seg(t, 1.6, 4.55));
-    // на ударе рой кратко приглушаем (иначе 18 000 аддитивных точек выжигают силуэт) и быстрее растворяем
-    this.swarmU.uFade.value = easeOutCubic(seg(t, 1.5, 2.4)) * (1 - 0.6 * burst(t, 4.5, 0.03, 0.22)) * (1 - easeInOutSine(seg(t, 4.5, 4.95)));
-    const rot = 0.62 * (1 - easeInOutCubic(seg(t, 1.4, 8.0)));
-    this.logoRoot.rotation.y = rot + Math.sin(t * 0.5) * 0.015;
-    this.logoRoot.rotation.x = Math.sin(t * 0.4) * 0.012;
-    this.logoRoot.position.y = this.logoCenter.y + Math.sin(t * 0.7) * 0.025;
-    this.logoRoot.scale.setScalar(1 + 0.04 * (1 - easeOutCubic(seg(t, 4.2, 8))));
-
-    this.logoParts.forEach((p, i) => {
-      const m = this.logoMeshes[i];
-      const k = seg(t, p.start, p.start + p.dur);
-      const u = m.material.userData.u;
-      u.uReveal.value = easeInOutSine(k) * 1.0;
-      m.visible = k > 0.0001;
-      u.uFlash.value = burst(t, 4.52, 0.05, 0.5) * 0.3 + burst(t, p.start + p.dur * 0.9, 0.05, 0.4) * 0.3;
-    });
-
     // title letters
-    this.letterMeshes.forEach(({ mesh, start, land, L, seed }) => {
-      const p = seg(t, start, start + TL.letterDur);
-      const e = easeOutCubic(p);
-      const e2 = 1 - Math.pow(1 - p, 5);
+    const tt = lt('title');
+    this.titleRoot.visible = TT.enabled;
+    this.titleRoot.position.set(TT.x, TT.y + -0.66 * (1 - TT.scale), this.stackZ.title);
+    this.titleRoot.scale.setScalar(TT.scale);
+    const tease = EASE[TT.easing] || EASE.cubic;
+    this.letterMeshes.forEach(({ mesh, start, land, L, seed, r }) => {
+      const p = seg(tt, start, start + TT.duration);
+      const xf = letterXf(TT.preset, p, { seed, r, a: TT.intensity, ease: tease });
       mesh.visible = p > 0;
-      mesh.position.set(L.center.x, L.center.y - (1 - e2) * 0.5, -(1 - e2) * 6.5);
-      mesh.rotation.set((1 - e) * 1.0 * seed, (1 - e) * 0.7 * -seed, (1 - e) * 0.15 * seed);
-      mesh.scale.setScalar(1 + (1 - e) * 0.08);
+      mesh.position.set(L.center.x + xf.x, L.center.y + xf.y, L.center.z + xf.z);
+      mesh.rotation.set(xf.rx, xf.ry, xf.rz);
+      mesh.scale.setScalar(Math.max(1e-4, xf.s));
       const u = mesh.material.userData.u;
-      u.uReveal.value = easeInOutSine(seg(p, 0.02, 0.85));
-      u.uFlash.value = burst(t, land, 0.04, 0.38) * 1.1;
+      u.uReveal.value = xf.reveal;
+      u.uFlash.value = burst(tt, land, 0.04, 0.38) * 1.1 * TT.flash;
+      this.setCol(u.uGD.value, TT.deep); this.setCol(u.uGM.value, TT.mid); this.setCol(u.uGT.value, TT.top);
+      u.uGradY.value.set(-1.15 + TT.y, -0.1 + TT.y);
+      mesh.material.roughness = TT.roughness;
+      mesh.material.envMapIntensity = TT.env;
     });
+    const ts = TT.start - 5.75 + TT.delay; // сдвиг событий, привязанных к названию
 
     // sweeping light (title + final shimmer)
-    const sw = this.sweepState(t);
+    const sw = this.sweepState(t - (TT.start - 5.75));
+    const swAmt = sw.amt * fxk(FX.sweep);
     this.sweepLight.position.x = sw.x;
-    this.sweepLight.intensity = sw.amt * 58;
+    this.sweepLight.intensity = swAmt * 58;
     sharedGold.uSweepX.value = sw.x;
-    sharedGold.uSweepAmt.value = sw.amt;
+    sharedGold.uSweepAmt.value = swAmt;
 
     // dividers
-    const l1 = easeInOutCubic(seg(t, TL.lineStart, TL.lineStart + 1.35));
-    this.div1.L.visible = this.div1.R.visible = l1 > 0;
-    this.div1.L.material.uniforms.uProg.value = l1;
-    this.div1.R.material.uniforms.uProg.value = l1;
-    const d1 = seg(t, TL.lineStart - 0.1, TL.lineStart + 0.6);
-    this.popDiamond(this.div1.d, d1, t, 0);
-    const l2 = easeInOutCubic(seg(t, TL.line2Start, TL.line2Start + 1.1));
-    this.div2.L.visible = this.div2.R.visible = l2 > 0;
-    this.div2.L.material.uniforms.uProg.value = l2;
-    this.div2.R.material.uniforms.uProg.value = l2;
-    this.popDiamond(this.div2.d, seg(t, TL.line2Start - 0.1, TL.line2Start + 0.55), t, 1.7);
+    const dt = lt('dividers');
+    const dd = DV.duration, d2 = dd * 0.815;
+    const placeLine = (m, dy, f) => {
+      const ln = m.userData.line;
+      m.scale.x = f;
+      m.position.x = ln.inner - ln.dir * (ln.w * f) / 2;
+      m.position.y = m.userData.baseY + dy;
+    };
+    const showLines = (d, on) => { d.L.visible = d.R.visible = on; };
+    const l1 = easeInOutCubic(seg(dt, DV.start1, DV.start1 + dd));
+    const on1 = DV.enabled && DV.first;
+    showLines(this.div1, on1 && l1 > 0);
+    [this.div1.L, this.div1.R].forEach((m) => { m.material.uniforms.uProg.value = l1; m.material.uniforms.uAlpha.value = DV.intensity; placeLine(m, DV.y1, DV.width); });
+    this.popDiamond(this.div1.d, seg(dt, DV.start1 - 0.1, DV.start1 + 0.6), t, 0);
+    this.div1.d.visible = this.div1.d.visible && on1 && DV.diamonds;
+    this.div1.d.position.y = this.div1.d.userData.baseY + DV.y1;
+    const l2 = easeInOutCubic(seg(dt, DV.start2, DV.start2 + d2));
+    const on2 = DV.enabled && DV.second;
+    showLines(this.div2, on2 && l2 > 0);
+    [this.div2.L, this.div2.R].forEach((m) => { m.material.uniforms.uProg.value = l2; m.material.uniforms.uAlpha.value = DV.intensity; placeLine(m, DV.y2, DV.width); });
+    this.popDiamond(this.div2.d, seg(dt, DV.start2 - 0.1, DV.start2 + 0.55), t, 1.7);
+    this.div2.d.visible = this.div2.d.visible && on2 && DV.diamonds;
+    this.div2.d.position.y = this.div2.d.userData.baseY + DV.y2;
 
     // subtitle + date
-    const sr = easeInOutCubic(seg(t, TL.subStart, TL.subStart + 1.9));
-    this.sub.visible = sr > 0.001;
-    this.sub.material.uniforms.uReveal.value = sr;
-    this.sub.scale.x = 1.07 - 0.07 * easeOutCubic(seg(t, TL.subStart, TL.subStart + 2.4));
-    this.sub.material.uniforms.uShine.value = 0.55 + 0.25 * Math.sin(t * 1.3);
-    const dr = easeInOutCubic(seg(t, TL.dateStart, TL.dateStart + 1.6));
-    this.date.visible = dr > 0.001;
-    this.date.material.uniforms.uReveal.value = dr;
-    this.date.scale.x = 1.07 - 0.07 * easeOutCubic(seg(t, TL.dateStart, TL.dateStart + 2.2));
-    this.date.material.uniforms.uShine.value = 0.5 + 0.2 * Math.sin(t * 1.1 + 1);
+    this.updateText(this.sub, SB, t, 1.3, 0, 0.55, 0.25);
+    this.updateText(this.date, DT, t, 1.1, 1, 0.5, 0.2);
 
     // FX
     const setFlare = (f, v) => {
+      v *= fxk(FX.flares);
       f.s.material.opacity = Math.min(1, v);
       f.s.visible = v > 0.003;
       f.s.scale.set(f.sx * (0.7 + 0.5 * Math.min(1, v)), f.sy * (0.6 + 0.6 * Math.min(1, v)), 1);
     };
-    setFlare(this.flareLogo, burst(t, 4.5, 0.07, 0.4) * 0.26 + 0.1 * easeOutCubic(seg(t, 5.5, 8)) * (0.8 + 0.2 * Math.sin(t * 0.8)));
-    setFlare(this.flareTitle, burst(t, 7.7, 0.25, 0.7) * 0.5 + 0.14 * easeOutCubic(seg(t, 7.5, 10)) + burst(t, TL.sweep2 + 0.4, 0.3, 0.7) * 0.35);
-    setFlare(this.flareSub, burst(t, 9.6, 0.3, 0.6) * 0.45);
+    this.flareLogo.s.position.set(lcx, lcy - 0.2, 0.4);
+    this.flareTitle.s.position.set(TT.x, -0.66 + TT.y, 0.4);
+    this.flareSub.s.position.set(SB.x, P(0, 537).y + SB.y, 0.4);
+    setFlare(this.flareLogo, burst(t, 4.5, 0.07, 0.4) * 0.2 + 0.1 * easeOutCubic(seg(gt, 5.5, 8)) * (0.8 + 0.2 * Math.sin(t * 0.8)));
+    setFlare(this.flareTitle, burst(t - ts, 7.7, 0.25, 0.7) * 0.5 + 0.14 * easeOutCubic(seg(t - ts, 7.5, 10)) + burst(t, TL.sweep2 + 0.4, 0.3, 0.7) * 0.35);
+    setFlare(this.flareSub, burst(t - SB.start + 8.35 - SB.delay, 9.6, 0.3, 0.6) * 0.45);
     const cg = this.coreGlow;
-    cg.material.opacity = easeOutCubic(seg(t, 3.0, 4.6)) * 0.28 * (1 - 0.6 * seg(t, 5, 7)) + burst(t, 4.5, 0.06, 0.4) * 0.09;
+    cg.position.set(lcx, lcy, -0.3);
+    cg.material.opacity = (easeOutCubic(seg(t, 3.0, 4.6)) * 0.28 * (1 - 0.6 * seg(t, 5, 7)) + burst(t, 4.5, 0.06, 0.4) * 0.09) * fxk(FX.flash);
     const cgs = 6 + burst(t, 4.5, 0.06, 0.8) * 3;
     cg.scale.set(cgs, cgs, 1);
     cg.visible = cg.material.opacity > 0.003;
 
     const w1 = seg(t, 4.5, 6.1);
-    this.waveLogo.visible = w1 > 0 && w1 < 1;
+    this.waveLogo.position.set(lcx, lcy, 0.3);
+    this.waveLogo.visible = w1 > 0 && w1 < 1 && fxk(FX.waves) > 0;
     // плоскость 34×34: радиус считаем в мировых единицах (до 9 — за краем кадра), ширина растёт с радиусом
     this.waveLogo.material.uniforms.uR.value = (easeOutCubic(w1) * 9.2) / 17;
-    this.waveLogo.material.uniforms.uA.value = Math.pow(1 - w1, 1.5) * 0.3 * (0.45 + 0.55 * seg(w1, 0, 0.12));
+    this.waveLogo.material.uniforms.uA.value = Math.pow(1 - w1, 1.5) * 0.3 * (0.45 + 0.55 * seg(w1, 0, 0.12)) * fxk(FX.waves);
     this.waveLogo.material.uniforms.uW.value = (0.12 + w1 * 0.55) / 17;
-    const w2 = seg(t, 7.75, 9.2);
-    this.waveTitle.visible = w2 > 0 && w2 < 1;
+    const w2 = seg(t - ts, 7.75, 9.2);
+    this.waveTitle.position.set(TT.x, -0.66 + TT.y, 0.3);
+    this.waveTitle.visible = w2 > 0 && w2 < 1 && fxk(FX.waves) > 0;
     this.waveTitle.material.uniforms.uR.value = easeOutCubic(w2) * 1.0;
-    this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.8) * 0.3;
+    this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.8) * 0.3 * fxk(FX.waves);
     this.waveTitle.material.uniforms.uW.value = 0.02 + w2 * 0.08;
 
     // анаморфные полосы: нарастают к удару, вспыхивают на нём, оживают на названии и финальном блике
-    this.streak.strength = Math.min(1.1,
+    this.streak.strength = PO.streak * Math.min(1.1,
       0.1 * easeOutCubic(seg(t, 2.6, 4.5)) +
       0.3 * burst(t, 4.5, 0.05, 0.8) +
-      0.1 * burst(t, 7.7, 0.25, 0.8) +
+      0.1 * burst(t - ts, 7.7, 0.25, 0.8) +
       0.05 * easeOutCubic(seg(t, 8, 10)) +
       0.09 * burst(t, TL.sweep2 + 0.3, 0.35, 0.7)) * easeOutCubic(seg(t, 1.5, 2.5));
     // объёмные лучи света из эмблемы
-    F.uRays.value =
+    F.uRays.value = fxk(FX.rays) * (
       0.12 * easeInOutSine(seg(t, 3.0, 4.5)) * (t < 4.5 ? 1 : 0) +
-      0.2 * burst(t, 4.5, 0.05, 0.8) +
+      0.14 * burst(t, 4.5, 0.05, 0.8) +
       0.05 * easeOutCubic(seg(t, 6, 9)) * (0.85 + 0.15 * Math.sin(t * 0.9)) +
-      0.03 * burst(t, TL.sweep2 + 0.3, 0.4, 0.7);
+      0.03 * burst(t, TL.sweep2 + 0.3, 0.4, 0.7));
 
     // звёздные блики: пробегают вслед за световым лучом и редко мерцают в финале
     this.glints.forEach((gl, i) => {
       const dx = (gl.x - sw.x) * 0.8;
-      const swept = Math.exp(-dx * dx) * sw.amt * (t > 5.9 ? 1 : 0);
+      const swept = Math.exp(-dx * dx) * swAmt * (t > 5.9 ? 1 : 0);
       const tw = Math.pow(0.5 + 0.5 * Math.sin(t * 1.35 + gl.phase), 18) * 0.7 * easeOutCubic(seg(t, 9, 11));
       const intro = burst(t, 4.7 + i * 0.07, 0.08, 0.35) * (i < 6 ? 0.9 : 0);
-      const v = Math.min(1, swept + tw + intro);
+      const v = Math.min(1, (swept + tw + intro) * fxk(FX.glints));
       gl.s.visible = v > 0.01;
       gl.s.material.opacity = v;
       const sc = gl.size * (0.35 + 0.9 * v);
@@ -1116,7 +1368,30 @@ export class Intro {
     });
 
     // bloom breathes with the story
-    this.bloom.strength = 0.5 + 0.1 * burst(t, 4.5, 0.08, 0.6) + 0.1 * burst(t, TL.sweep2, 0.4, 0.9);
+    this.bloom.strength = PO.bloom * (0.5 + 0.1 * burst(t, 4.5, 0.08, 0.6) + 0.1 * burst(t, TL.sweep2, 0.4, 0.9));
+    this.bloom.radius = PO.bloomRadius;
+    this.bloom.threshold = PO.bloomThreshold;
+  }
+
+  /** Текстовый слой (подзаголовок/дата): пресеты wipe / fade / rise / spread. */
+  updateText(m, S, t, shineF, shineP, shineA, shineB) {
+    const tl = t - S.delay;
+    const k = seg(tl, S.start, S.start + S.duration);
+    const r = easeInOutCubic(k);
+    const e = easeOutCubic(k);
+    const u = m.material.uniforms;
+    m.visible = S.enabled && r > 0.001;
+    let reveal = r, bright = S.brightness, sx = 1.07 - 0.07 * easeOutCubic(seg(tl, S.start, S.start + S.duration * 1.26)), dy = 0;
+    if (S.preset === 'fade') { reveal = 1; bright = S.brightness * r; sx = 1; }
+    else if (S.preset === 'rise') { dy = (1 - e) * 0.4; sx = 1; }
+    else if (S.preset === 'spread') { sx = 1.4 - 0.4 * e; }
+    u.uReveal.value = reveal;
+    u.uBright.value = bright;
+    u.uShine.value = shineA + shineB * Math.sin(t * shineF + shineP);
+    this.setCol(u.uColA.value, S.colA);
+    this.setCol(u.uColB.value, S.colB);
+    m.scale.x = sx;
+    m.position.set(S.x, m.userData.baseY + S.y + dy, 0.1);
   }
 
   popDiamond(m, k, t, phase) {

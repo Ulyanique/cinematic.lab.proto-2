@@ -9,7 +9,7 @@ export const sharedGold = {
 
 const GOLD_FRAG_HEAD = /* glsl */ `
 uniform float uReveal, uExtent, uFlash, uTime, uSweepX, uSweepAmt;
-uniform vec3 uCenter, uDir;
+uniform vec3 uCenter, uDir, uGD, uGM, uGT;
 uniform vec2 uGradY;
 varying vec3 vLocal;
 varying vec3 vWorldP;
@@ -37,6 +37,9 @@ export function makeGold(params = {}) {
     uDir: { value: new THREE.Vector3(0, -1, 0) },
     uExtent: { value: 1 },
     uFlash: { value: 0 },
+    uGD: { value: new THREE.Color('#e4b159') },
+    uGM: { value: new THREE.Color('#ffe29e') },
+    uGT: { value: new THREE.Color('#fff2c8') },
     uGradY: { value: new THREE.Vector2(params.gradBot ?? -1, params.gradTop ?? 3) },
     uTime: sharedGold.uTime,
     uSweepX: sharedGold.uSweepX,
@@ -68,9 +71,9 @@ export function makeGold(params = {}) {
         '#include <color_fragment>',
         /* glsl */ `#include <color_fragment>
         float gy=clamp((vWorldP.y-uGradY.x)/(uGradY.y-uGradY.x),0.,1.);
-        vec3 gDeep=vec3(0.78,0.44,0.10);
-        vec3 gMid=vec3(1.0,0.76,0.34);
-        vec3 gTop=vec3(1.0,0.89,0.58);
+        vec3 gDeep=uGD;
+        vec3 gMid=uGM;
+        vec3 gTop=uGT;
         vec3 gcol=mix(gDeep,gMid,smoothstep(0.0,0.55,gy));
         gcol=mix(gcol,gTop,smoothstep(0.45,1.0,gy));
         diffuseColor.rgb*=gcol;
