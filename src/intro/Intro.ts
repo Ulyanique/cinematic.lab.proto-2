@@ -1,5 +1,6 @@
 // @ts-nocheck
 import * as THREE from 'three';
+import { Output, Mp4OutputFormat, WebMOutputFormat, BufferTarget, CanvasSource, canEncodeVideo } from 'mediabunny';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
@@ -60,15 +61,16 @@ export class Intro {
   host: HTMLElement;
   duration = 13.6;
   onFrame: ((t: number) => void) | null = null;
+  onContextLost: (() => void) | null = null;
   freeze: number | null = null;
   playing = false;
   t = 0;
   private startAt = 0;
-  private mouse = new THREE.Vector2();
-  private mouseS = new THREE.Vector2();
   private pxW = 1920;
   private pxH = 1080;
   private forced = false;
+  private disposed = false;
+  private cancelRecording: (() => void) | null = null;
 
   constructor(host: HTMLElement) {
     this.host = host;
@@ -77,28 +79,38 @@ export class Intro {
   /* ------------------------------------------------------------ init */
   async init() {
     await document.fonts.load('100px Forum', 'ВЕЧЕР РЕТРОСПЕКТИВА 20 НОЯБРЯ 2026 ГОДА');
+    if (this.disposed) return;
 
     const renderer = (this.renderer = new THREE.WebGLRenderer({
       antialias: false,
       powerPreference: 'high-performance',
       alpha: false,
+      preserveDrawingBuffer: true,
     }));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 0.9;
     renderer.setClearColor(0x000000, 1);
     renderer.domElement.style.cssText = 'width:100%;height:100%;display:block';
     this.host.appendChild(renderer.domElement);
+    this.handleContextLost = (event: Event) => {
+      event.preventDefault();
+      this.cancelRecording?.();
+      this.onContextLost?.();
+    };
+    renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost);
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(30, 16 / 9, 0.1, 200);
     this.camera.position.set(0, 0, 21);
+    this.scene.add(this.camera);
 
     this.U = {
       uTime: { value: 0 },
       uScale: { value: 2000 },
     };
 
-    this.scene.environment = makeEnvironment(renderer);
+    this.environmentTarget = makeEnvironment(renderer);
+    this.scene.environment = this.environmentTarget.texture;
     this.scene.environmentIntensity = 1.0;
 
     this.setupLights();
@@ -107,6 +119,7 @@ export class Intro {
     this.setupArcs();
     this.setupLogo();
     await this.setupTitle();
+    if (this.disposed) { this.dispose(); return; }
     this.setupSubtitle();
     this.setupDividers();
     this.setupFX();
@@ -115,11 +128,7 @@ export class Intro {
     this.applySize();
     this.ro = new ResizeObserver(() => !this.forced && this.applySize());
     this.ro.observe(this.host);
-    this.onPointer = (e: PointerEvent) => {
-      const r = this.host.getBoundingClientRect();
-      this.mouse.set(((e.clientX - r.left) / r.width - 0.5) * 2, -((e.clientY - r.top) / r.height - 0.5) * 2);
-    };
-    window.addEventListener('pointermove', this.onPointer);
+
 
     renderer.setAnimationLoop(() => this.frame());
   }
@@ -246,48 +255,47 @@ export class Intro {
     this.arcs = [];
     this.dots = [];
     const glow = this.glowTex();
-    const mk = (cpx, cpy, R, startDeg, lenDeg, opts) => {
-      const c = P(cpx, cpy);
-      const geo = new THREE.RingGeometry(R - 0.5, R + 0.5, 320, 1);
+    // The centres are fixed to screen corners, not world-space positions.
+    // Complete rings extend beyond the viewport, so they remain curved circles
+    // instead of rotating a short arc in and out of view.
+    this.cornerRings = [new THREE.Group(), new THREE.Group()];
+    this.camera.add(...this.cornerRings);
+    const mk = (group, R, opts) => {
+      const geo = new THREE.RingGeometry(R - 0.12, R + 0.12, 320, 1);
       const mat = this.additive(arcVert, arcFrag, {
         uProg: { value: 0 },
         uR: { value: R },
-        uStart: { value: (startDeg * Math.PI) / 180 },
-        uLen: { value: (lenDeg * Math.PI) / 180 },
+        uStart: { value: 0 },
+        uLen: { value: Math.PI * 2 },
         uDash: { value: opts.dash || 0 },
         uAlpha: { value: opts.alpha ?? 1 },
-        uW: { value: opts.w ?? 0.012 },
+        uW: { value: opts.w ?? 0.006 },
         uTime: this.U.uTime,
-      });
+      }, { depthTest: false });
       const m = new THREE.Mesh(geo, mat);
-      m.position.set(c.x, c.y, -0.6);
       m.renderOrder = 3;
-      this.scene.add(m);
-      this.arcs.push({ mesh: m, t0: opts.t0, t1: opts.t1 });
-      return { c, R, startDeg, lenDeg };
+      group.add(m);
+      this.arcs.push({ mesh: m, t0: 0, t1: 1.5, speed: opts.speed });
+      return { group, R, speed: opts.speed };
     };
-    const node = (arc, tt, size, t0) => {
-      const a = ((arc.startDeg + arc.lenDeg * tt) * Math.PI) / 180;
-      const s = new THREE.Sprite(
-        new THREE.SpriteMaterial({ map: glow, color: new THREE.Color(2.4, 1.6, 0.7), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true })
-      );
-      s.position.set(arc.c.x + Math.cos(a) * arc.R, arc.c.y + Math.sin(a) * arc.R, -0.5);
+    const node = (arc, angle, size, t0) => {
+      const s = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: glow, color: new THREE.Color(2.4, 1.6, 0.7), blending: THREE.AdditiveBlending,
+        depthWrite: false, depthTest: false, transparent: true,
+      }));
       s.renderOrder = 6;
-      this.scene.add(s);
-      this.dots.push({ s, size, t0 });
+      arc.group.add(s);
+      this.dots.push({ s, size, t0, R: arc.R, angle, speed: arc.speed });
     };
-    // top-left
-    const a1 = mk(-30, -35, 3.95, -93, 97, { t0: 0.9, t1: 3.7, w: 0.013 });
-    mk(-30, -35, 4.4, -90, 88, { t0: 1.3, t1: 4.0, dash: 70, w: 0.008, alpha: 0.75 });
-    const a3 = mk(-30, -35, 3.42, -92, 62, { t0: 1.6, t1: 4.1, w: 0.008, alpha: 0.85 });
-    node(a3, 0.56, 0.4, 3.1);
-    node(a1, 0.74, 0.22, 2.9);
-    // bottom-right
-    const b1 = mk(1330, 760, 4.1, 92, 88, { t0: 1.3, t1: 4.1, w: 0.014 });
-    mk(1330, 760, 4.55, 98, 84, { t0: 1.7, t1: 4.4, dash: 80, w: 0.008, alpha: 0.75 });
-    mk(1330, 760, 3.6, 100, 76, { t0: 2.0, t1: 4.6, w: 0.007, alpha: 0.7 });
-    node(b1, 0.54, 0.46, 3.4);
-    node(b1, 0.2, 0.2, 3.7);
+    const makeCorner = (group, direction) => {
+      const inner = mk(group, 1.24, { speed: 0.25 * direction, w: 0.0035, alpha: 0.72 });
+      mk(group, 1.43, { speed: -0.19 * direction, dash: 145, w: 0.0025, alpha: 0.48 });
+      const outer = mk(group, 1.58, { speed: 0.16 * direction, w: 0.003, alpha: 0.58 });
+      node(inner, 0.75, 0.075, 0.5);
+      node(outer, 2.2, 0.065, 0.7);
+    };
+    makeCorner(this.cornerRings[0], 1);
+    makeCorner(this.cornerRings[1], -1);
   }
 
   setupLogo() {
@@ -328,7 +336,7 @@ export class Intro {
     const tmp = new THREE.Vector3(), nrm = new THREE.Vector3();
     this.logoParts.forEach((p, i) => {
       const n = Math.round((N * areas[i]) / sum);
-      const s = new MeshSurfaceSampler(new THREE.Mesh(p.geometry)).build();
+      const s = new MeshSurfaceSampler(new THREE.Mesh(p.geometry)).setRandomGenerator(r).build();
       for (let k = 0; k < n; k++) {
         s.sample(tmp, nrm);
         tgt.push(tmp.x, tmp.y, tmp.z + p.z);
@@ -617,10 +625,12 @@ export class Intro {
   }
 
   setupPost() {
-    const rt = new THREE.WebGLRenderTarget(1920, 1080, { type: THREE.HalfFloatType, samples: 4 });
+    // Multisampled HDR buffers are very expensive and unreliable on some GPUs.
+    // Start small: applySize allocates the actual preview/recording dimensions.
+    const rt = new THREE.WebGLRenderTarget(320, 180, { type: THREE.HalfFloatType, samples: 0 });
     this.composer = new EffectComposer(this.renderer, rt);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(1920, 1080), 0.6, 0.7, 1.0);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(320, 180), 0.6, 0.7, 1.0);
     this.composer.addPass(this.bloom);
     this.composer.addPass(new OutputPass());
     this.fp = new ShaderPass({ ...finalPass, uniforms: THREE.UniformsUtils.clone(finalPass.uniforms) });
@@ -629,10 +639,10 @@ export class Intro {
 
   /* ------------------------------------------------------------ sizing */
   applySize(w?: number, h?: number) {
-    const pr = Math.min(window.devicePixelRatio || 1, 2);
+    const pr = Math.min(window.devicePixelRatio || 1, 1);
     let W = w ?? Math.round(this.host.clientWidth * pr);
     let H = h ?? Math.round(this.host.clientHeight * pr);
-    if (W > 2560) { H = Math.round((H * 2560) / W); W = 2560; }
+    if (!this.forced && W > 1280) { H = Math.round((H * 1280) / W); W = 1280; }
     W = Math.max(W, 320); H = Math.max(H, 180);
     this.pxW = W; this.pxH = H;
     this.renderer.setPixelRatio(1);
@@ -655,34 +665,74 @@ export class Intro {
     this.freeze = null;
   }
 
-  async record(onDone?: () => void): Promise<Blob> {
+  /** Offline rendering: one explicitly timestamped canvas sample per frame. */
+  async record(onProgress?: (progress: number) => void): Promise<Blob> {
+    if (this.disposed) throw new Error('Сцена закрыта');
+    if (this.forced) throw new Error('Экспорт уже выполняется');
+    if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
+      throw new Error('Покадровый экспорт не поддерживается браузером. Попробуйте актуальный Chrome или Edge.');
+    }
     this.forced = true;
-    this.applySize(1920, 1080);
-    const stream = this.renderer.domElement.captureStream(60);
-    const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m));
-    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 28_000_000 });
-    const chunks: BlobPart[] = [];
-    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-    const done = new Promise<Blob>((res) => (rec.onstop = () => res(new Blob(chunks, { type: 'video/webm' }))));
-    this.play();
-    rec.start(200);
-    await new Promise<void>((res) => {
-      const iv = setInterval(() => {
-        if (this.t > this.duration) { clearInterval(iv); res(); }
-      }, 100);
-    });
-    rec.stop();
-    const blob = await done;
-    this.forced = false;
-    this.applySize();
-    onDone?.();
-    return blob;
+    let cancelled = false;
+    this.cancelRecording = () => { cancelled = true; };
+    let output: Output | undefined;
+    const previousTime = this.t;
+    const previousFreeze = this.freeze;
+    const wasPlaying = this.playing;
+    const fps = 30;
+    try {
+      const options = { width: 1920, height: 1080, bitrate: 16_000_000, frameRate: fps };
+      const codec = await canEncodeVideo('avc', options) ? 'avc'
+        : await canEncodeVideo('vp9', options) ? 'vp9'
+        : await canEncodeVideo('vp8', options) ? 'vp8' : null;
+      if (cancelled || this.disposed) throw new Error('Экспорт отменён');
+      if (!codec) throw new Error('Нет доступного кодировщика видео 1920×1080. Попробуйте Chrome или Edge.');
+      this.renderer.setAnimationLoop(null);
+      this.applySize(1920, 1080);
+      const target = new BufferTarget();
+      output = new Output({ format: codec === 'avc' ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
+      const source = new CanvasSource(this.renderer.domElement, { codec, bitrate: options.bitrate });
+      output.addVideoTrack(source, { frameRate: fps });
+      await output.start();
+      const frames = Math.round(this.duration * fps);
+      for (let i = 0; i < frames; i++) {
+        if (cancelled || this.disposed) throw new Error('Экспорт отменён');
+        this.t = i / fps;
+        this.update(this.t);
+        this.composer.render();
+        await source.add(i / fps, 1 / fps, { keyFrame: i % (fps * 2) === 0 });
+        if (i % 3 === 0) {
+          onProgress?.((i + 1) / frames);
+          // Give the browser an opportunity to paint the export progress.
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+      }
+      if (cancelled || this.disposed) throw new Error('Экспорт отменён');
+      onProgress?.(1);
+      await output.finalize();
+      if (cancelled || this.disposed) throw new Error('Экспорт отменён');
+      if (!target.buffer) throw new Error('Не удалось создать видео');
+      return new Blob([target.buffer], { type: codec === 'avc' ? 'video/mp4' : 'video/webm' });
+    } catch (error) {
+      if (output && output.state !== 'finalized' && output.state !== 'canceled') await output.cancel();
+      throw error;
+    } finally {
+      this.cancelRecording = null;
+      this.forced = false;
+      if (!this.disposed) {
+        this.t = previousTime;
+        this.freeze = previousFreeze;
+        this.playing = wasPlaying;
+        this.startAt = performance.now() - previousTime * 1000;
+        this.applySize();
+        this.renderer.setAnimationLoop(() => this.frame());
+      }
+    }
   }
 
   frame() {
     if (this.freeze !== null) this.t = this.freeze;
     else if (this.playing) this.t = (performance.now() - this.startAt) / 1000;
-    this.mouseS.lerp(this.mouse, 0.04);
     this.update(this.t);
     this.composer.render();
     this.onFrame?.(this.t);
@@ -697,11 +747,11 @@ export class Intro {
     const ck = easeInOutSine(seg(t, 0, 12.5));
     const sway = 1;
     this.camera.position.set(
-      (1 - ck) * -1.6 + Math.sin(t * 0.33) * 0.1 * sway + this.mouseS.x * 0.35,
-      (1 - ck) * 0.8 + Math.cos(t * 0.27) * 0.06 * sway + this.mouseS.y * 0.2,
+      (1 - ck) * -1.6 + Math.sin(t * 0.33) * 0.1 * sway,
+      (1 - ck) * 0.8 + Math.cos(t * 0.27) * 0.06 * sway,
       16.8 + (1 - ck) * 4.6
     );
-    this.camera.lookAt(this.mouseS.x * 0.15, 0, 0);
+    this.camera.lookAt(0, 0, 0);
     this.camera.rotation.z += (1 - ck) * 0.025;
     this.bgMat.uniforms.uCam.value.set(this.camera.position.x * -0.25, this.camera.position.y * -0.25);
 
@@ -727,11 +777,20 @@ export class Intro {
     this.dustU.uIn.value = easeOutCubic(seg(t, 0.2, 2.5));
     this.bokehU.uIn.value = easeOutCubic(seg(t, 0.6, 3.5));
 
+    // Keep the ring centres at the viewport corners at every camera position.
+    const cornerY = 10 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
+    const cornerX = cornerY * this.camera.aspect;
+    this.cornerRings[0].position.set(-cornerX, cornerY, -10);
+    this.cornerRings[1].position.set(cornerX, -cornerY, -10);
+
     // arcs
-    this.arcs.forEach(({ mesh, t0, t1 }) => {
+    this.arcs.forEach(({ mesh, t0, t1, speed }) => {
+      mesh.rotation.z = t * speed;
       mesh.material.uniforms.uProg.value = easeInOutSine(seg(t, t0, t1));
     });
-    this.dots.forEach(({ s, size, t0 }) => {
+    this.dots.forEach(({ s, size, t0, R, angle, speed }) => {
+      const a = angle + t * speed;
+      s.position.set(Math.cos(a) * R, Math.sin(a) * R, 0);
       const k = easeOutBack(seg(t, t0, t0 + 0.7));
       const pulse = 1 + 0.25 * Math.sin(t * 2.4 + t0 * 5);
       const sc = Math.max(0, k) * size * pulse * (1 + burst(t, 4.55, 0.1, 0.6) * 0.8);
@@ -860,9 +919,33 @@ export class Intro {
   }
 
   dispose() {
+    this.disposed = true;
+    this.cancelRecording?.();
     this.renderer?.setAnimationLoop(null);
     this.ro?.disconnect();
-    window.removeEventListener('pointermove', this.onPointer);
+    const geometries = new Set();
+    const materials = new Set();
+    const textures = new Set();
+    this.scene?.traverse((obj) => {
+      if (obj.geometry) geometries.add(obj.geometry);
+      const list = Array.isArray(obj.material) ? obj.material : [obj.material];
+      list.filter(Boolean).forEach((material) => {
+        materials.add(material);
+        Object.values(material).forEach((value) => { if (value?.isTexture) textures.add(value); });
+        Object.values(material.uniforms || {}).forEach((uniform) => {
+          if (uniform?.value?.isTexture) textures.add(uniform.value);
+        });
+      });
+    });
+    this.environmentTarget?.dispose();
+    this.environmentTarget = null;
+    if (this.scene) this.scene.environment = null;
+    geometries.forEach((g) => g.dispose());
+    materials.forEach((m) => m.dispose());
+    textures.forEach((t) => t.dispose());
+    this.composer?.passes.forEach((pass) => pass.dispose?.());
+    this.composer?.dispose();
+    if (this.handleContextLost) this.renderer?.domElement.removeEventListener('webglcontextlost', this.handleContextLost);
     this.renderer?.dispose();
     this.renderer?.domElement.remove();
   }
