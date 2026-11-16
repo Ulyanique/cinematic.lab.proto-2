@@ -330,6 +330,8 @@ export const finalPass = {
     uAspect: { value: 1.7778 },
     uRes: { value: [1920, 1080] },
     uOpen: { value: 1 },       // половина высоты видимой «щели» (в UV); >0.5 — кадр полностью открыт
+    uSlitMix: { value: 1 },    // 1 — жёсткая маска «щели», 0 — мягкое затемнение вместо неё
+    uLineVisible: { value: 1 },// 1 — пролог с линией-зажиганием разрешён
     uLine: { value: 0 },       // длина линии-зажигания 0..1
     uLineI: { value: 0 },      // её яркость
     uBlur: { value: 0 },       // радиус расфокуса (UV)
@@ -347,7 +349,7 @@ export const finalPass = {
   fragmentShader: /* glsl */ `
     precision highp float;
     uniform sampler2D tDiffuse;
-    uniform float uTime, uFade, uAspect, uOpen, uLine, uLineI, uBlur, uShock, uShockAmp, uCA, uPulse, uRays, uZoom, uGhost, uVig, uGrainK, uSat, uCon, uHue, uShadow;
+    uniform float uTime, uFade, uAspect, uOpen, uLine, uLineI, uBlur, uShock, uShockAmp, uCA, uPulse, uRays, uZoom, uGhost, uVig, uGrainK, uSat, uCon, uHue, uShadow, uSlitMix, uLineVisible;
     uniform vec2 uRes, uShockC;
     varying vec2 vUv;
     vec3 hueRot(vec3 c,float a){ vec3 k=vec3(0.57735); float ca=cos(a); return c*ca+cross(k,c)*sin(a)+k*dot(k,c)*(1.-ca); }
@@ -445,12 +447,16 @@ export const finalPass = {
       col+=gr*uGrainK*(1.-0.4*col);
       col*=uFade;
 
-      // кинематографическая «щель»: кадр раскрывается из линии света
+      // кинематографическая «щель»: кадр раскрывается из линии света.
+      // Маска не должна выжигать кадр: при тонкой щели она смешивается с мягким затемнением,
+      // а мягкая кромка считается относительно uOpen — без «жёсткого» перехода на 1.6 px.
       float dy=abs(d.y);
-      float vis=1.-smoothstep(uOpen-0.0016, uOpen+0.0016, dy);
-      col*=vis;
+      float softEdge=max(0.004, uOpen*0.35);
+      float vis=1.-smoothstep(max(0.0, uOpen-softEdge), uOpen+softEdge, dy);
+      float dim=mix(1., 0.22, smoothstep(0.5, 0.02, uOpen)*step(uOpen,0.5));
+      col*=mix(dim, vis, uSlitMix);
       float edge=exp(-pow((dy-uOpen)*55.,2.))*step(uOpen,0.5)*smoothstep(0.0,0.02,uOpen);
-      col+=vec3(1.,0.66,0.26)*edge*0.22*vis;
+      col+=vec3(1.,0.66,0.26)*edge*0.22*mix(1.,vis,uSlitMix);
 
       // линия-зажигание: горячее ядро + анаморфный шлейф
       float half_=uLine*0.62;
@@ -460,7 +466,7 @@ export const finalPass = {
       float streak=exp(-abs(d.x)*2.4)*exp(-dy*dy*20000.)*0.7;
       float ig=(core*3.2+halo)*lx+streak*step(0.001,uLine);
       vec3 lc=mix(vec3(1.,0.62,0.2),vec3(1.,0.93,0.75),core);
-      col+=lc*ig*uLineI;
+      col+=lc*ig*uLineI*uLineVisible;
       gl_FragColor=vec4(col,1.);
     }
   `,

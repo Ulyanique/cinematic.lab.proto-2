@@ -78,6 +78,13 @@ export class Intro {
   private anchorPending = false;
   private pxW = 1920;
   private pxH = 1080;
+  /** false до первого реального applySize — иначе проверка «размер не изменился» съест первый вызов */
+  private _sized = false;
+  /** true после первого круга: повтор входит в кадр быстрее, без длинного чёрного пролога */
+  private loopRound = false;
+  private _playedOnce = false;
+  private renderFails = 0;
+  private onVisibility: (() => void) | null = null;
   private forced = false;
   private disposed = false;
   private cancelRecording: (() => void) | null = null;
@@ -105,7 +112,9 @@ export class Intro {
     }));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 0.9;
-    renderer.setClearColor(0x000000, 1);
+    // Не чистый чёрный: если проход композера почему-то не отрисовался, зритель увидит
+    // тёмный тёплый кадр, а не провал в черноту (это же значение даёт фону «пол»).
+    renderer.setClearColor(0x050403, 1);
     renderer.domElement.style.cssText = 'width:100%;height:100%;display:block';
     this.host.appendChild(renderer.domElement);
     this.handleContextLost = (event: Event) => {
@@ -114,6 +123,21 @@ export class Intro {
       this.onContextLost?.();
     };
     renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost);
+    // Фоновая вкладка: requestAnimationFrame останавливается, а время считается по performance.now().
+    // При возврате получался скачок на десятки секунд — ролик «телепортировался» в финал или на
+    // чёрный кадр пролога (при зацикливании). Переякорим таймлайн и не рисуем, пока вкладка скрыта.
+    this.onVisibility = () => {
+      if (document.hidden) {
+        if (this.playing) this.anchor = this.t;
+        return;
+      }
+      if (this.playing) {
+        this.startAt = performance.now() - this.anchor * 1000;
+        this.t = this.anchor;
+      }
+      this.perf = { n: 0, sum: 0, last: performance.now() };
+    };
+    document.addEventListener('visibilitychange', this.onVisibility);
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(30, 16 / 9, 0.1, 200);
@@ -867,6 +891,11 @@ export class Intro {
     const cap = Math.min(this.qualityCap, this.cfg.general.quality);
     if (!this.forced && W > cap) { H = Math.round((H * cap) / W); W = cap; }
     W = Math.max(W, 320); H = Math.max(H, 180);
+    // Пересоздание render target'ов стоит кадров: без этой проверки каждый тик ползунка
+    // (setConfig → applySize) и каждое понижение качества переаллоцировали весь композер,
+    // а на слабом GPU это заметные «провалы в чёрное».
+    if (W === this.pxW && H === this.pxH && this._sized) return;
+    this._sized = true;
     this.pxW = W; this.pxH = H;
     this.renderer.setPixelRatio(1);
     this.renderer.setSize(W, H, false);
@@ -958,6 +987,9 @@ export class Intro {
 
   /* ------------------------------------------------------------ playback */
   play(from = 0) {
+    // повтор с начала: пролог не должен снова «моргать» на секунду
+    if (from <= 0.001) this.loopRound = this._playedOnce;
+    this._playedOnce = true;
     this.startAt = performance.now() - from * 1000;
     this.anchor = from;
     this.anchorPending = true;
@@ -1080,13 +1112,24 @@ export class Intro {
       if (this.anchorPending) { this.startAt = performance.now() - this.anchor * 1000; this.anchorPending = false; }
       this.t = (performance.now() - this.startAt) / 1000;
     }
-    if (this.playing && this.freeze === null && this.cfg.general.loop && this.t > this.duration + 0.4) {
+    // Зацикливание: в конце ролик гаснет (0.45 с), поэтому переход на новый круг не выглядит
+    // как «камера ушла в черноту» — кадр уходит в чёрный плавно, вместе со звуком.
+    const tail = this.duration;
+    if (this.playing && this.freeze === null && this.cfg.general.loop && this.t > tail + 0.35) {
       this.onLoop?.();
       this.play(0);
       this.t = 0;
     }
     this.update(this.t);
-    this.composer.render();
+    try {
+      this.composer.render();
+      this.renderFails = 0;
+    } catch (e) {
+      // Сбой одного прохода (потеря контекста, нехватка памяти на 4K) не должен «вешать»
+      // чёрный кадр навсегда: считаем ошибки и сообщаем наружу, продолжая цикл.
+      if (++this.renderFails <= 3) console.error('render failed', e);
+      if (this.renderFails === 3) this.onWarn?.('Не удалось отрисовать кадр. Уменьшите разрешение превью в настройках.');
+    }
     this.onFrame?.(this.t);
   }
 
@@ -1142,13 +1185,22 @@ export class Intro {
     this.camera.rotation.z += (1 - ck) * CM.roll + Math.sin(t * 59) * 0.004 * shake;
     this.bgMat.uniforms.uCam.value.set(this.camera.position.x * -0.25, this.camera.position.y * -0.25);
 
-    // global fade-in
-    const fadeIn = easeOutCubic(seg(t, 0.95, 2.2));
+    // global fade-in.
+    // Раньше он стартовал на 0.95 с, а линия-зажигание появлялась на 0.25 с: первые ~1.1 с
+    // кадр был абсолютно чёрным (при зацикливании — «камера уходит в черноту» каждый круг).
+    // Теперь пролог начинается сразу: короткое затемнение с тёплым «полом», чтобы кадр
+    // никогда не был чистым чёрным, а повтор круга не показывал длинную чёрную паузу.
+    const fadeIn = 0.3 + 0.7 * easeOutCubic(seg(t, 0, this.loopRound ? 0.4 : 1.0));
     const F = this.fp.uniforms;
     const dip = 0.3 * easeInOutSine(seg(t, 4.1, 4.48)) * (t < 4.5 ? 1 : 0);
-    // в экспортируемом видео картинка уходит в чёрный вместе со звуком
+    // в экспортируемом видео картинка уходит в чёрный вместе со звуком;
+    // в превью с зацикливанием — тоже, иначе круг обрывается резким чёрным кадром
     const dur = this.duration;
-    const fadeOut = this.forced && G.fadeOut ? 1 - easeInOutSine(seg(real, dur - 0.6, dur)) : 1;
+    // Экспорт — честный уход в чёрный; превью с зацикливанием — «провал в темень» до 12 %
+    // и сразу новый круг: зритель не видит 0.4 с абсолютно чёрного экрана на каждом стыке.
+    const fadeOutAt = this.forced && G.fadeOut ? dur : G.loop ? dur + 0.35 : -1;
+    const fadeFloor = this.forced ? 0 : 0.12;
+    const fadeOut = fadeOutAt > 0 ? 1 - (1 - fadeFloor) * easeInOutSine(seg(real, fadeOutAt - 0.35, fadeOutAt)) : 1;
     F.uFade.value = fadeIn * (1 - dip) * fadeOut;
     F.uTime.value = t;
     F.uVig.value = PO.vignette;
@@ -1160,14 +1212,23 @@ export class Intro {
 
     // ПРОЛОГ: искра → линия света → «щель» раскрывается в cinemascope → удар раскрывает кадр целиком
     const ign = PO.ignition ? 1 : 0;
-    const lineGrow = 1 - Math.pow(1 - seg(t, 0.25, 1.55), 4);
+    // искра и линия стартуют практически с нулевого кадра: раньше до 0.25 с в кадре был
+    // только чёрный (а при зацикливании это читалось как «камера ушла в черноту»)
+    // «Искра уже горит на входе»: сдвигаем старт зажигания в минус, чтобы самый первый кадр
+    // (t = 0) не был пустым чёрным — иначе на стыке кругов глаз ловит провал.
+    const lineGrow = 1 - Math.pow(1 - seg(t, -0.35, 1.55), 4);
     F.uLine.value = lineGrow * 1.25 * ign;
-    const spark = burst(t, 0.2, 0.35, 0.9);
+    const spark = burst(t, -0.25, 0.35, 0.9);
     F.uLineI.value = (0.25 + 0.75 * easeOutCubic(seg(t, 0.2, 1.0)) + 0.5 * spark) * (1 - easeInOutSine(seg(t, 1.9, 3.1))) * ign;
     const so = PO.slitSize;
     const open1 = easeInOutCubic(seg(t, 1.05, 2.75)) * so;
     const open2 = (1 - Math.pow(1 - seg(t, 4.46, 5.2), 4)) * (0.62 - so);
     F.uOpen.value = !PO.slit ? 1 : t < 4.46 ? open1 : so + open2;
+    // «щель» гасит кадр маской по вертикали: при тонкой щели (меньше 2.5 % высоты) кадр
+    // превращался в чёрный экран с полоской. Плавно переводим маску в затемнение
+    // и оставляем видимой больше строк — кадр читается даже в самом начале.
+    F.uSlitMix.value = !PO.slit ? 0 : 1 - easeInOutSine(seg(so, 0.012, 0.045));
+    F.uLineVisible.value = PO.ignition ? 1 : 0;
     // фокус-пулл: из мягкого боке в резкость, на ударе — короткий «вдох» расфокуса
     F.uBlur.value = (0.014 * (1 - easeInOutSine(seg(t, 1.1, 4.4))) + 0.0045 * burst(t, 4.5, 0.03, 0.18)) * PO.focus;
     // ударная волна и хроматика
@@ -1507,6 +1568,7 @@ export class Intro {
     this.composer?.passes.forEach((pass) => pass.dispose?.());
     this.composer?.dispose();
     if (this.handleContextLost) this.renderer?.domElement.removeEventListener('webglcontextlost', this.handleContextLost);
+    if (this.onVisibility) document.removeEventListener('visibilitychange', this.onVisibility);
     this.renderer?.dispose();
     this.renderer?.domElement.remove();
   }
