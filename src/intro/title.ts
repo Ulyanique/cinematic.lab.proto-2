@@ -11,7 +11,9 @@ export interface Letter {
 }
 
 export async function buildTitle(fontUrl: string, text: string, targetWidth: number, tracking = 0.06) {
-  const buf = await (await fetch(fontUrl)).arrayBuffer();
+  const response = await fetch(fontUrl);
+  if (!response.ok) throw new Error(`Не удалось загрузить шрифт: ${response.status}`);
+  const buf = await response.arrayBuffer();
   const font = parseFont(buf);
 
   const layout = (fs: number) => {

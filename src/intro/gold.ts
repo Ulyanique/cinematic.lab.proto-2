@@ -82,7 +82,8 @@ export function makeGold(params = {}) {
         totalEmissiveRadiance+=gcol*gcol*0.2*(0.8+0.4*dn);
         totalEmissiveRadiance+=vec3(1.0,0.5,0.1)*dedge*5.0;
         totalEmissiveRadiance+=vec3(1.0,0.62,0.22)*uFlash*0.55;
-        float sheen=exp(-pow((vWorldP.x-uSweepX)*0.9,2.));
+        float sweepDist=(vWorldP.x-uSweepX)*0.9;
+        float sheen=exp(-sweepDist*sweepDist);
         totalEmissiveRadiance+=vec3(1.0,0.72,0.34)*sheen*uSweepAmt*0.22*(0.5+0.5*dn);
         `
       );
@@ -132,5 +133,9 @@ export function makeEnvironment(renderer) {
   const pmrem = new THREE.PMREMGenerator(renderer);
   const rt = pmrem.fromScene(s, 0.025);
   pmrem.dispose();
-  return rt.texture;
+  s.traverse((obj) => {
+    obj.geometry?.dispose();
+    obj.material?.dispose();
+  });
+  return rt;
 }
