@@ -339,13 +339,15 @@ export const finalPass = {
     uCA: { value: 0 },         // дополнительная хроматическая аберрация
     uPulse: { value: 0 },      // вспышка экспозиции
     uRays: { value: 0 },       // объёмные лучи из эмблемы
+    uZoom: { value: 0 },       // зум-блюр к эмблеме
+    uGhost: { value: 0 },      // «призраки» линзы
     uVig: { value: 0.62 }, uGrainK: { value: 0.02 }, uSat: { value: 1 }, uCon: { value: 1 }, uHue: { value: 0 }, uShadow: { value: 1 },
   },
   vertexShader: /* glsl */ `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
   fragmentShader: /* glsl */ `
     precision highp float;
     uniform sampler2D tDiffuse;
-    uniform float uTime, uFade, uAspect, uOpen, uLine, uLineI, uBlur, uShock, uShockAmp, uCA, uPulse, uRays, uVig, uGrainK, uSat, uCon, uHue, uShadow;
+    uniform float uTime, uFade, uAspect, uOpen, uLine, uLineI, uBlur, uShock, uShockAmp, uCA, uPulse, uRays, uZoom, uGhost, uVig, uGrainK, uSat, uCon, uHue, uShadow;
     uniform vec2 uRes, uShockC;
     varying vec2 vUv;
     vec3 hueRot(vec3 c,float a){ vec3 k=vec3(0.57735); float ca=cos(a); return c*ca+cross(k,c)*sin(a)+k*dot(k,c)*(1.-ca); }
@@ -359,10 +361,10 @@ export const finalPass = {
       vec2 sc=(uv-uShockC)*vec2(uAspect,1.);
       float sr=length(sc);
       vec2 sdir=sr>1e-4? sc/sr : vec2(0.);
-      float ring=exp(-pow((sr-uShock)*15.,2.))*uShockAmp;
-      uv-=sdir*vec2(1./uAspect,1.)*ring*0.022;
+      float ring=exp(-pow((sr-uShock)*11.,2.))*uShockAmp;
+      uv-=sdir*vec2(1./uAspect,1.)*ring*0.02;
 
-      vec2 off=d*r2*(0.005+uCA*0.03)+sdir*vec2(1./uAspect,1.)*ring*0.006;
+      vec2 off=d*r2*(0.005+uCA*0.03)+sdir*vec2(1./uAspect,1.)*ring*0.0022;
 
       vec3 col;
       if(uBlur>0.0015){
@@ -385,6 +387,32 @@ export const finalPass = {
         col.b=texture2D(tDiffuse, uv-off).b;
       }
 
+      // зум-блюр: радиальный «удар» к эмблеме
+      if(uZoom>0.002){
+        vec2 zd=(uShockC-uv)*uZoom/12.;
+        float zj=h21(vUv*uRes+11.1);
+        vec3 zacc=col; float zw=1.;
+        for(int i=1;i<12;i++){
+          float k=float(i)+zj;
+          float w=1.-float(i)/13.;
+          zacc+=texture2D(tDiffuse,uv+zd*k).rgb*w; zw+=w;
+        }
+        col=mix(col,zacc/zw,0.85);
+      }
+      // «призраки» линзы: зеркальные отражения ярких зон с лёгкой дисперсией
+      if(uGhost>0.002){
+        vec3 gh=vec3(0.);
+        for(int i=0;i<4;i++){
+          float k=0.32+0.23*float(i);
+          vec2 gu=0.5+(0.5-vUv)*k;
+          float edge=pow(clamp(1.-length(gu-.5)/0.62,0.,1.),2.);
+          vec3 gs=vec3(texture2D(tDiffuse,gu+0.004*k*(gu-.5)).r,texture2D(tDiffuse,gu).g,texture2D(tDiffuse,gu-0.004*k*(gu-.5)).b);
+          gs=max(gs-0.72,vec3(0.));
+          vec3 tint=mix(vec3(1.,.72,.38),vec3(.55,.8,1.),fract(float(i)*.37));
+          gh+=gs*tint*edge/(1.+float(i)*.5);
+        }
+        col+=gh*uGhost*0.9;
+      }
       // объёмные лучи (god rays): радиальное размытие ярких зон к центру эмблемы
       if(uRays>0.002){
         vec2 delta=(uv-uShockC)*0.62/24.;

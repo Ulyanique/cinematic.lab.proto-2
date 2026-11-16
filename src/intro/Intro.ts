@@ -844,9 +844,10 @@ export class Intro {
   }
 
   setupPost() {
-    // Multisampled HDR buffers are very expensive and unreliable on some GPUs.
     // Start small: applySize allocates the actual preview/recording dimensions.
-    const rt = new THREE.WebGLRenderTarget(320, 180, { type: THREE.HalfFloatType, samples: 0 });
+    // MSAA ×4 в HDR-буфере: без него кромки эмблемы и букв ступенчатые. На GPU без поддержки — откат на 0.
+    const msaa = Math.min(4, this.renderer.capabilities.maxSamples || 0);
+    const rt = new THREE.WebGLRenderTarget(320, 180, { type: THREE.HalfFloatType, samples: msaa >= 2 ? msaa : 0 });
     this.composer = new EffectComposer(this.renderer, rt);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
     this.bloom = new UnrealBloomPass(new THREE.Vector2(320, 180), 0.6, 0.7, 1.0);
@@ -1401,6 +1402,9 @@ export class Intro {
       0.1 * burst(t - ts, 7.7, 0.25, 0.8) +
       0.05 * easeOutCubic(seg(t, 8, 10)) +
       0.09 * burst(t, TL.sweep2 + 0.3, 0.35, 0.7)) * easeOutCubic(seg(t, 1.5, 2.5));
+    // зум-блюр на ударе и «призраки» линзы на пиках света (премиальная оптика)
+    F.uZoom.value = fxk(FX.flash) * burst(t, 4.5, 0.012, 0.09) * 0.075 * PO.aberration;
+    F.uGhost.value = fxk(FX.flares) * (burst(t, 4.52, 0.05, 0.4) * 0.55 + burst(t, TL.sweep2 + 0.3, 0.3, 0.55) * 0.3 + burst(t - ts, 7.7, 0.25, 0.5) * 0.2);
     // объёмные лучи света из эмблемы
     F.uRays.value = fxk(FX.rays) * (
       0.12 * easeInOutSine(seg(t, 3.0, 4.5)) * (t < 4.5 ? 1 : 0) +

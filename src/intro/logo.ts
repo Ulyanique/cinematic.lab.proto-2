@@ -2,7 +2,8 @@ import * as THREE from 'three';
 import { SVGLoader } from 'three/examples/jsm/loaders/SVGLoader.js';
 import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import logoSvg from '../assets/logo.svg?raw';
-import { cleanPaths, resolveOverlaps, pathsToShapes, pathsToPolys, flattenCaps } from './polyfix';
+import { cleanPaths, resolveOverlaps, pathsToPolys, flattenCaps } from './polyfix';
+import { extrudePolys } from './extrude';
 
 /** Pixel coordinates from the original 1280×720 composition to world units. */
 export const P = (x: number, y: number) => new THREE.Vector2((x - 640) / 80, (360 - y) / 80);
@@ -44,7 +45,7 @@ export function buildLogoParts(opts: LogoOpts): LogoPart[] {
       .filter((r) => r.length >= 3);
     if (!rings.length) return;
     rings.forEach((r) => r.forEach((p) => bb.expandByPoint(new THREE.Vector2(p.x, p.y))));
-    const fr = path.userData?.style?.fillRule;
+    const fr = (path.userData?.style as any)?.fillRule;
     rawParts.push({ rings, rule: fr === 'evenodd' || (!fr && globalEvenOdd) ? 'evenodd' : 'nonzero' });
   });
   if (!rawParts.length) throw new Error('Не удалось прочитать контуры логотипа SVG');
@@ -75,19 +76,18 @@ export function buildLogoParts(opts: LogoOpts): LogoPart[] {
   const raws: THREE.BufferGeometry[] = [];
   const ringsOf: { x: number; y: number }[][][] = [];
   groups.forEach((paths) => {
-    const shapes = pathsToShapes(paths, K);
-    if (!shapes.length) return;
-    const g = new THREE.ExtrudeGeometry(shapes, {
+    const polys = pathsToPolys(paths, K);
+    if (!polys.length) return;
+    // собственный экструдер: фаска не схлопывается в узких зазорах (штрихи «S», перемычки)
+    const g = extrudePolys(polys, {
       depth,
-      bevelEnabled: bevel > 0.5,
-      bevelThickness: bevel,
-      bevelSize: bevel * 0.82,
-      bevelSegments: 4,
-      curveSegments: 12,
+      bevelThickness: bevel > 0.5 ? bevel : 0,
+      bevelSize: bevel > 0.5 ? bevel * 0.82 : 0,
+      segments: 5,
     });
-    g.translate(0, 0, -depth / 2);
+    if (!g.attributes.position.count) { g.dispose(); return; }
     raws.push(g);
-    ringsOf.push(pathsToPolys(paths, K).flatMap((q) => [q.outer, ...q.holes]));
+    ringsOf.push(polys.flatMap((q) => [q.outer, ...q.holes]));
   });
   if (!raws.length) throw new Error('Не удалось прочитать контуры логотипа SVG');
 

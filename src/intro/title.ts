@@ -1,7 +1,8 @@
 // @ts-nocheck
 import * as THREE from 'three';
 import { parse as parseFont } from 'opentype.js';
-import { fixRings, flattenCaps } from './polyfix';
+import { cleanPaths, pathsToPolys, flattenCaps } from './polyfix';
+import { extrudePolys } from './extrude';
 import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 export interface Letter {
@@ -20,7 +21,7 @@ function loadFont(url: string) {
       fetch(url).then(async (r) => {
         if (!r.ok) throw new Error(`Не удалось загрузить шрифт: ${r.status}`);
         return parseFont(await r.arrayBuffer());
-      })
+      }).catch((e) => { fontCache.delete(url); throw e; }) // не помним неудачу: следующая попытка загрузит заново
     );
   }
   return fontCache.get(url)!;
@@ -85,26 +86,25 @@ export async function buildTitle(fontUrls: string[], text: string, targetWidth: 
       } else if (c.type === 'Z') { if (ring && ring.length > 2) rings.push(ring); ring = null; }
     }
     if (ring && ring.length > 2) rings.push(ring);
-    const shapes = fixRings(rings, { scale: 200_000 / Math.max(fs, 1e-6), rule: 'nonzero', weld: fs * 0.0004, minArea: fs * fs * 1e-6 });
-    if (!shapes.length) continue;
-    const g0 = new THREE.ExtrudeGeometry(shapes, {
+    const fo = { scale: 200_000 / Math.max(fs, 1e-6), rule: 'nonzero', weld: fs * 0.0004, minArea: fs * fs * 1e-6 };
+    const polys = pathsToPolys(cleanPaths(rings, fo), fo.scale);
+    if (!polys.length) continue;
+    const g0 = extrudePolys(polys, {
       depth,
-      bevelEnabled: bevel > 0.001,
-      bevelThickness: bevel,
-      bevelSize: bevel * 0.8,
-      bevelSegments: 5,
-      curveSegments: 14,
+      bevelThickness: bevel > 0.001 ? bevel : 0,
+      bevelSize: bevel > 0.001 ? bevel * 0.8 : 0,
+      segments: 5,
     });
-    g0.translate(-lay.width / 2, 0, -depth / 2);
+    if (!g0.attributes.position.count) { g0.dispose(); continue; }
+    g0.translate(-lay.width / 2, 0, 0);
     const g = flattenCaps(toCreasedNormals(g0, 0.5));
     g0.dispose();
     g.computeBoundingBox();
     const bb = g.boundingBox;
     const zf = depth / 2 + bevel + 0.003;
     const edgeRings = [];
-    for (const sh of shapes) {
-      const { shape, holes } = sh.extractPoints(1);
-      for (const ring of [shape, ...holes]) edgeRings.push(ring.map((q) => new THREE.Vector3(q.x - lay.width / 2, q.y, zf)));
+    for (const pl of polys) {
+      for (const ring of [pl.outer, ...pl.holes]) edgeRings.push(ring.map((q) => new THREE.Vector3(q.x - lay.width / 2, q.y, zf)));
     }
     letters.push({
       rings: edgeRings,

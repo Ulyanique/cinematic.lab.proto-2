@@ -180,13 +180,15 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLElement && (e.target.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON|VIDEO)$/.test(e.target.tagName))) return;
       poke();
-      if (!recordingRef.current && (e.code === 'Space' || e.key === 'r' || e.key === 'R')) {
+      // физические клавиши (e.code): работают в любой раскладке, в том числе в русской
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (!recordingRef.current && (e.code === 'Space' || e.code === 'KeyR')) {
         e.preventDefault();
         replay();
       }
-      if (e.key === 'p' || e.key === 'P' || e.key === 'з' || e.key === 'З') togglePause();
-      if (e.key === 'f' || e.key === 'F') toggleFs();
-      if (e.key === 'm' || e.key === 'M' || e.key === 'ь' || e.key === 'Ь') toggleSound();
+      if (e.code === 'KeyP') togglePause();
+      if (e.code === 'KeyF') toggleFs();
+      if (e.code === 'KeyM') toggleSound();
       if (e.key === 'Escape') { setOpenSettings(false); setOpenComp(false); }
     };
     window.addEventListener('keydown', onKey);
