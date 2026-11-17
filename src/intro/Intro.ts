@@ -59,6 +59,11 @@ const TL = {
   sweep2: 10.9,
 };
 
+export const OUTRO_CREDITS_TEXT = 'ИСТОРИЯ ПРОДОЛЖАЕТСЯ';
+export const OUTRO_CREDITS_DURATION = 4;
+const OUTRO_CREDITS_FADE_IN = 0.7;
+const OUTRO_CREDITS_FADE_OUT = 1.1;
+
 export type ClipMode = 'intro' | 'outro' | 'background';
 
 /**
@@ -166,6 +171,53 @@ class DividerOverlayPass extends Pass {
   }
 }
 
+class OutroCreditsPass extends Pass {
+  material: THREE.ShaderMaterial;
+  quad: FullScreenQuad;
+
+  constructor(texture: THREE.Texture) {
+    super();
+    this.material = new THREE.ShaderMaterial({
+      uniforms: {
+        tBase: { value: null },
+        tCredits: { value: texture },
+        uOpacity: { value: 0 },
+      },
+      vertexShader: /* glsl */ `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
+      fragmentShader: /* glsl */ `
+        precision highp float;
+        uniform sampler2D tBase, tCredits;
+        uniform float uOpacity;
+        varying vec2 vUv;
+        void main(){
+          vec4 base=texture2D(tBase,vUv);
+          vec4 credits=texture2D(tCredits,vUv);
+          float a=clamp(credits.a*uOpacity,0.,1.);
+          gl_FragColor=vec4(mix(base.rgb,credits.rgb,a),1.);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+      blending: THREE.NoBlending,
+    });
+    this.quad = new FullScreenQuad(this.material);
+    this.needsSwap = true;
+  }
+
+  render(renderer: THREE.WebGLRenderer, writeBuffer: THREE.WebGLRenderTarget, readBuffer: THREE.WebGLRenderTarget) {
+    this.material.uniforms.tBase.value = readBuffer.texture;
+    renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
+    this.quad.render(renderer);
+  }
+
+  dispose() {
+    this.material.uniforms.tCredits.value.dispose();
+    this.material.dispose();
+    this.quad.dispose();
+  }
+}
+
 export class Intro {
   host: HTMLElement;
   cfg: Config = cloneConfig(DEFAULT_CONFIG);
@@ -208,7 +260,12 @@ export class Intro {
   /* ------------------------------------------------------------ init */
   async init() {
     const LY = this.cfg.layers;
-    await Promise.all([loadFontFace(LY.title.font, LY.title.text), loadFontFace(LY.subtitle.font, LY.subtitle.text), loadFontFace(LY.date.font, LY.date.text)]);
+    await Promise.all([
+      loadFontFace(LY.title.font, LY.title.text),
+      loadFontFace(LY.subtitle.font, LY.subtitle.text),
+      loadFontFace(LY.date.font, LY.date.text),
+      loadFontFace('forum', OUTRO_CREDITS_TEXT),
+    ]);
     if (this.disposed) return;
 
     const renderer = (this.renderer = new THREE.WebGLRenderer({
@@ -990,6 +1047,47 @@ export class Intro {
     this.waveTitle.position.set(0, -0.66, 0.3);
   }
 
+  createOutroCreditsTexture() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1920;
+    canvas.height = 1080;
+    const ctx = canvas.getContext('2d');
+    const fontSize = 112;
+    const tracking = 12;
+    ctx.font = `400 ${fontSize}px "Forum"`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    const chars = [...OUTRO_CREDITS_TEXT];
+    const widths = chars.map((char) => ctx.measureText(char).width);
+    const textWidth = widths.reduce((sum, width) => sum + width, 0) + tracking * (chars.length - 1);
+    const startX = (canvas.width - textWidth) / 2;
+    const y = canvas.height / 2;
+    const gradient = ctx.createLinearGradient(startX, y, startX + textWidth, y);
+    gradient.addColorStop(0, '#d8aa60');
+    gradient.addColorStop(0.5, '#fff0c8');
+    gradient.addColorStop(1, '#d8aa60');
+
+    const drawLetters = () => {
+      let x = startX;
+      chars.forEach((char, i) => {
+        ctx.fillText(char, x, y);
+        x += widths[i] + tracking;
+      });
+    };
+    ctx.fillStyle = gradient;
+    ctx.shadowColor = 'rgba(255, 194, 105, 0.75)';
+    ctx.shadowBlur = 26;
+    drawLetters();
+    ctx.shadowBlur = 0;
+    drawLetters();
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.generateMipmaps = false;
+    return texture;
+  }
+
   setupPost() {
     // Start small: applySize allocates the actual preview/recording dimensions.
     // MSAA ×4 в HDR-буфере: без него кромки эмблемы и букв ступенчатые. На GPU без поддержки — откат на 0.
@@ -1007,6 +1105,8 @@ export class Intro {
     // Dividers are composited last, after the animated HDR and film-grain passes.
     this.dividerOverlay = new DividerOverlayPass(this.dividerScene, this.camera);
     this.composer.addPass(this.dividerOverlay);
+    this.creditsPass = new OutroCreditsPass(this.createOutroCreditsTexture());
+    this.composer.addPass(this.creditsPass);
   }
 
   /* ------------------------------------------------------------ sizing */
@@ -1038,7 +1138,9 @@ export class Intro {
   }
 
   /* ------------------------------------------------------------ config */
-  get duration() { return totalDuration(this.cfg); }
+  get duration() {
+    return totalDuration(this.cfg) + (this.clipMode === 'outro' ? OUTRO_CREDITS_DURATION : 0);
+  }
 
   sigOf(c: Config) {
     const L = c.layers, pick = (o, ks) => JSON.stringify(ks.map((k) => o[k]));
@@ -1281,6 +1383,7 @@ export class Intro {
   }
 
   update(real: number, frameDelta = 1 / this.cfg.general.fps) {
+    const sceneDuration = totalDuration(this.cfg);
     const duration = this.duration;
     const elapsed = Math.max(0, Math.min(duration, real));
     const reverse = this.clipMode === 'outro';
@@ -1290,16 +1393,37 @@ export class Intro {
     if (backgroundOnly) {
       // Hold the intro's completed composition while cyclic time animates its final-state details.
       const phase = elapsed / duration;
-      const finalT = Math.max(this.warp(duration), baseDuration);
+      const finalT = Math.max(this.warp(sceneDuration), baseDuration);
       const motionT = finalT + Math.sin(phase * Math.PI * 2) * 0.65;
       this.updateDesign(motionT, elapsed, frameStep);
+      this.creditsPass.material.uniforms.uOpacity.value = 0;
       return;
     }
 
-    // Match the intro's sampled frames exactly, from its final rendered frame back to frame zero.
-    const lastFrameTime = Math.max(0, (Math.round(duration * this.cfg.general.fps) - 1) / this.cfg.general.fps);
-    const sceneTime = reverse ? Math.max(0, lastFrameTime - elapsed) : elapsed;
+    // Reverse the complete intro first; the added tail is reserved for the final end-credit card.
+    const lastFrameTime = Math.max(0, (Math.round(sceneDuration * this.cfg.general.fps) - 1) / this.cfg.general.fps);
+    const sceneElapsed = reverse ? Math.min(sceneDuration, elapsed) : elapsed;
+    const sceneTime = reverse ? Math.max(0, lastFrameTime - sceneElapsed) : elapsed;
     this.updateDesign(this.warp(sceneTime), sceneTime, frameStep);
+
+    const creditsElapsed = reverse ? elapsed - sceneDuration : -1;
+    this.updateOutroCredits(creditsElapsed);
+  }
+
+  updateOutroCredits(elapsed: number) {
+    const active = this.clipMode === 'outro' && elapsed >= 0;
+    const fadeIn = active ? easeOutCubic(seg(elapsed, 0, OUTRO_CREDITS_FADE_IN)) : 0;
+    const fadeOutStart = OUTRO_CREDITS_DURATION - OUTRO_CREDITS_FADE_OUT;
+    const fadeOut = active ? 1 - easeInOutSine(seg(elapsed, fadeOutStart, OUTRO_CREDITS_DURATION)) : 1;
+    this.creditsPass.material.uniforms.uOpacity.value = fadeIn * fadeOut;
+
+    if (!active) return;
+    // The reversed scene has ended in black. Keep it fully black beneath the separate credits pass.
+    this.fp.uniforms.uFade.value = 0;
+    this.fp.uniforms.uOpen.value = 1;
+    this.fp.uniforms.uSlitMix.value = 0;
+    this.fp.uniforms.uLineVisible.value = 0;
+    this.dividerOverlay.enabled = false;
   }
 
   setCol(c, hex) {
@@ -1357,7 +1481,7 @@ export class Intro {
     const dip = backgroundOnly ? 0 : 0.3 * easeInOutSine(seg(t, 4.1, 4.48)) * (t < 4.5 ? 1 : 0);
     // в экспортируемом видео картинка уходит в чёрный вместе с финальным кадром;
     // в превью с зацикливанием — тоже, иначе круг обрывается резким чёрным кадром
-    const dur = this.duration;
+    const dur = totalDuration(C);
     // Экспорт — честный уход в чёрный; превью с зацикливанием — «провал в темень» до 12 %
     // и сразу новый круг: зритель не видит 0.4 с абсолютно чёрного экрана на каждом стыке.
     const reverseOutro = this.clipMode === 'outro';

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Intro, type ClipMode } from './intro/Intro';
+import { Intro, OUTRO_CREDITS_DURATION, type ClipMode } from './intro/Intro';
 import { DEFAULT_CONFIG, DESIGN_IMPACT, cloneConfig, sanitizeConfig, setPath, totalDuration, type Config } from './intro/config';
 import { CompositionPanel, GearIcon, LayersIcon, SettingsPanel, type Tab } from './ui/Panels';
 
@@ -201,7 +201,8 @@ export default function App() {
 
   /* ------------------------------------------------------------ главы таймлайна (реальное время) */
   const g = cfg.general;
-  const duration = totalDuration(cfg);
+  const sceneDuration = totalDuration(cfg);
+  const duration = sceneDuration + (clipMode === 'outro' ? OUTRO_CREDITS_DURATION : 0);
   const real = (tau: number) => (tau < DESIGN_IMPACT ? (tau * g.impact) / DESIGN_IMPACT : g.impact + (tau - DESIGN_IMPACT) / g.speed);
   const L = cfg.layers;
   const storyChapters = [
@@ -211,11 +212,14 @@ export default function App() {
     { t: real(L.subtitle.start + L.subtitle.delay), label: 'Подзаголовок' },
     { t: real(L.date.start + L.date.delay), label: 'Дата' },
     { t: real(10.9), label: 'Блик' },
-  ].filter((c) => c.t >= 0 && c.t <= duration);
-  const chapters = clipMode === 'background' ? [] : storyChapters.map((c) => ({
-    ...c,
-    t: clipMode === 'outro' ? duration - c.t : c.t,
-  }));
+  ].filter((c) => c.t >= 0 && c.t <= sceneDuration);
+  const chapters = clipMode === 'background' ? [] : [
+    ...storyChapters.map((c) => ({
+      ...c,
+      t: clipMode === 'outro' ? sceneDuration - c.t : c.t,
+    })),
+    ...(clipMode === 'outro' ? [{ t: sceneDuration, label: 'Финальные титры' }] : []),
+  ];
   const EW = Math.round(g.width / 2) * 2, EH = Math.round((EW * 9) / 16 / 2) * 2;
 
   const openLayerSettings = (id: string) => { setSelected(id); setTab('layer'); setOpenSettings(true); };
