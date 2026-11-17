@@ -1,11 +1,12 @@
 // @ts-nocheck
 import * as THREE from 'three';
-import { Output, Mp4OutputFormat, WebMOutputFormat, BufferTarget, CanvasSource, AudioBufferSource, canEncodeVideo, getFirstEncodableAudioCodec } from 'mediabunny';
+import { Output, Mp4OutputFormat, WebMOutputFormat, BufferTarget, CanvasSource, canEncodeVideo } from 'mediabunny';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { Pass, FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
 import { MeshSurfaceSampler } from 'three/examples/jsm/math/MeshSurfaceSampler.js';
 import { fontOf, loadFontFace } from './fonts';
 import { DEFAULT_CONFIG, DESIGN_IMPACT, cloneConfig, totalDuration, type Config } from './config';
@@ -58,6 +59,111 @@ const TL = {
   sweep2: 10.9,
 };
 
+/**
+ * Draw dividers after all image effects. They are hairline graphics, not HDR light sources:
+ * sending them through bloom/streak extraction and animated film grain made their brightness
+ * depend on unrelated moving highlights. The pass keeps the rest of the composition untouched.
+ */
+class DividerOverlayPass extends Pass {
+  scene: THREE.Scene;
+  camera: THREE.Camera;
+  target: THREE.WebGLRenderTarget;
+  material: THREE.ShaderMaterial;
+  quad: FullScreenQuad;
+
+  constructor(scene: THREE.Scene, camera: THREE.Camera) {
+    super();
+    this.scene = scene;
+    this.camera = camera;
+    this.target = new THREE.WebGLRenderTarget(320, 180, {
+      type: THREE.HalfFloatType,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+    this.material = new THREE.ShaderMaterial({
+      uniforms: {
+        tBase: { value: null },
+        tDividers: { value: this.target.texture },
+        uAspect: { value: 16 / 9 },
+        uVignette: { value: 0.62 },
+        uFade: { value: 1 },
+        uOpen: { value: 1 },
+        uSlitMix: { value: 1 },
+      },
+      vertexShader: /* glsl */ `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
+      fragmentShader: /* glsl */ `
+        precision highp float;
+        uniform sampler2D tBase, tDividers;
+        uniform float uAspect, uVignette, uFade, uOpen, uSlitMix;
+        varying vec2 vUv;
+        vec3 srgbToLinear(vec3 c) {
+          vec3 lo=c/12.92;
+          vec3 hi=pow(max((c+0.055)/1.055,vec3(0.)),vec3(2.4));
+          return mix(lo,hi,step(vec3(0.04045),c));
+        }
+        vec3 linearToSrgb(vec3 c) {
+          vec3 lo=c*12.92;
+          vec3 hi=1.055*pow(max(c,vec3(0.)),vec3(1./2.4))-0.055;
+          return mix(lo,hi,step(vec3(0.0031308),c));
+        }
+        void main(){
+          vec3 base=texture2D(tBase,vUv).rgb;
+          vec3 line=texture2D(tDividers,vUv).rgb;
+          vec2 d=vUv-0.5;
+          float vignette=smoothstep(0.30,1.05,length(d*vec2(uAspect*0.72,1.15)));
+          float lineVignette=1.-vignette*uVignette;
+          float dy=abs(d.y);
+          float softEdge=max(0.004,uOpen*0.35);
+          float vis=1.-smoothstep(max(0.,uOpen-softEdge),uOpen+softEdge,dy);
+          float dim=mix(1.,0.22,(1.-smoothstep(0.02,0.5,uOpen))*step(uOpen,0.5));
+          float slit=mix(dim,vis,uSlitMix);
+          vec3 merged=srgbToLinear(base)+line*(lineVignette*uFade*slit);
+          gl_FragColor=vec4(linearToSrgb(merged),1.);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+      blending: THREE.NoBlending,
+    });
+    this.quad = new FullScreenQuad(this.material);
+    this.needsSwap = true;
+  }
+
+  setSize(width: number, height: number) {
+    this.target.setSize(width, height);
+  }
+
+  render(renderer: THREE.WebGLRenderer, writeBuffer: THREE.WebGLRenderTarget, readBuffer: THREE.WebGLRenderTarget) {
+    const oldAutoClear = renderer.autoClear;
+    const oldClearColor = renderer.getClearColor(new THREE.Color()).clone();
+    const oldClearAlpha = renderer.getClearAlpha();
+    try {
+      renderer.autoClear = false;
+      renderer.setClearColor(0x000000, 0);
+      renderer.setRenderTarget(this.target);
+      renderer.clear(true, false, false);
+      renderer.render(this.scene, this.camera);
+
+      this.material.uniforms.tBase.value = readBuffer.texture;
+      renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
+      renderer.clear(true, false, false);
+      this.quad.render(renderer);
+    } finally {
+      renderer.setClearColor(oldClearColor, oldClearAlpha);
+      renderer.autoClear = oldAutoClear;
+    }
+  }
+
+  dispose() {
+    this.target.dispose();
+    this.material.dispose();
+    this.quad.dispose();
+  }
+}
+
 export class Intro {
   host: HTMLElement;
   cfg: Config = cloneConfig(DEFAULT_CONFIG);
@@ -67,7 +173,6 @@ export class Intro {
   sigs: any = null;
   rebuildTimer: any = 0;
   onWarn: ((msg: string | null) => void) | null = null;
-  onLoop: (() => void) | null = null;
   onFrame: ((t: number) => void) | null = null;
   onContextLost: (() => void) | null = null;
   freeze: number | null = null;
@@ -89,9 +194,8 @@ export class Intro {
   private disposed = false;
   private cancelRecording: (() => void) | null = null;
   /** максимальная ширина рендера в превью; адаптивно снижается на слабых GPU */
-  lastExportHadAudio = false;
   private qualityCap = 1920;
-  private perf = { n: 0, sum: 0, last: 0 };
+  private perf = { n: 0, sum: 0, last: 0, slow: 0 };
 
   constructor(host: HTMLElement, cfg?: Config) {
     this.host = host;
@@ -135,7 +239,7 @@ export class Intro {
         this.startAt = performance.now() - this.anchor * 1000;
         this.t = this.anchor;
       }
-      this.perf = { n: 0, sum: 0, last: performance.now() };
+      this.perf = { n: 0, sum: 0, last: performance.now(), slow: 0 };
     };
     document.addEventListener('visibilitychange', this.onVisibility);
 
@@ -695,14 +799,23 @@ export class Intro {
   }
 
   setupDividers() {
+    // Keep only the bars in a separate scene; diamonds remain part of the regular HDR layers.
+    this.dividerScene = new THREE.Scene();
     const line = (cx, y, w, dir, h = 0.16) => {
       const mat = new THREE.ShaderMaterial({
         vertexShader: lineVert,
         fragmentShader: lineFrag,
         transparent: true,
+        depthTest: false,
         depthWrite: false,
+        toneMapped: false,
         blending: THREE.AdditiveBlending,
-        uniforms: { uProg: { value: 0 }, uDir: { value: dir }, uTime: this.U.uTime, uAlpha: { value: 1 } },
+        uniforms: {
+          uProg: { value: 0 }, uDir: { value: dir }, uAlpha: { value: 1 },
+          uCore: { value: 0.1 }, uGlow: { value: 0.14 }, uHighlight: { value: 0 },
+          uColor: { value: new THREE.Color('#ffb95e') },
+          uHotColor: { value: new THREE.Color('#fff1c9') },
+        },
       });
       const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
       m.position.set(cx, y, 0.05);
@@ -710,7 +823,7 @@ export class Intro {
       m.userData.line = { inner: cx + (dir * w) / 2, w, dir };
       m.renderOrder = 9;
       m.visible = false;
-      this.scene.add(m);
+      this.dividerScene.add(m);
       return m;
     };
     const diamond = (x, y, s) => {
@@ -888,6 +1001,9 @@ export class Intro {
     this.composer.addPass(new OutputPass());
     this.fp = new ShaderPass({ ...finalPass, uniforms: THREE.UniformsUtils.clone(finalPass.uniforms) });
     this.composer.addPass(this.fp);
+    // Dividers are composited last, after the animated HDR and film-grain passes.
+    this.dividerOverlay = new DividerOverlayPass(this.dividerScene, this.camera);
+    this.composer.addPass(this.dividerOverlay);
   }
 
   /* ------------------------------------------------------------ sizing */
@@ -1010,7 +1126,7 @@ export class Intro {
   }
 
   /** Offline rendering: one explicitly timestamped canvas sample per frame. */
-  async record(onProgress?: (progress: number) => void, audio?: AudioBuffer): Promise<Blob> {
+  async record(onProgress?: (progress: number) => void): Promise<Blob> {
     if (this.disposed) throw new Error('Сцена закрыта');
     if (this.forced) throw new Error('Экспорт уже выполняется');
     if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
@@ -1038,21 +1154,7 @@ export class Intro {
       output = new Output({ format: codec === 'avc' ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
       const source = new CanvasSource(this.renderer.domElement, { codec, bitrate: options.bitrate });
       output.addVideoTrack(source, { frameRate: fps });
-      let audioDone: Promise<void> | null = null;
-      let aSource: AudioBufferSource | undefined;
-      if (audio && this.cfg.general.exportAudio) {
-        // лучший доступный кодек, который умеет контейнер (MP4: AAC/Opus…, WebM: Opus/Vorbis)
-        const aOpts = { numberOfChannels: audio.numberOfChannels, sampleRate: audio.sampleRate, bitrate: 192_000 };
-        const aCodec = await getFirstEncodableAudioCodec(output.format.getSupportedAudioCodecs(), aOpts).catch(() => null);
-        if (aCodec) {
-          aSource = new AudioBufferSource({ codec: aCodec, bitrate: aOpts.bitrate });
-          output.addAudioTrack(aSource);
-        }
-      }
       await output.start();
-      // не ждём аудио последовательно с видео — иначе мультиплексор может упереться в обратное давление
-      this.lastExportHadAudio = !!aSource;
-      if (aSource && audio) audioDone = aSource.add(audio);
       const frames = Math.round(this.duration * fps);
       for (let i = 0; i < frames; i++) {
         if (cancelled || this.disposed) throw new Error('Экспорт отменён');
@@ -1068,7 +1170,6 @@ export class Intro {
       }
       if (cancelled || this.disposed) throw new Error('Экспорт отменён');
       onProgress?.(1);
-      if (audioDone) await audioDone;
       await output.finalize();
       if (cancelled || this.disposed) throw new Error('Экспорт отменён');
       if (!target.buffer) throw new Error('Не удалось создать видео');
@@ -1092,12 +1193,27 @@ export class Intro {
     }
   }
 
-  /** Если GPU не тянет — плавно снижаем разрешение превью (экспорт всегда 1920×1080). */
+  /** Если GPU не тянет — снижаем разрешение превью (экспорт всегда 1920×1080). */
   private adaptQuality() {
     const now = performance.now();
     const dt = now - this.perf.last;
     this.perf.last = now;
-    if (this.forced || this.freeze !== null || dt > 250 || dt <= 0) return;
+    if (this.forced || this.freeze !== null || dt <= 0) return;
+    // visibilitychange переякоривает таймер при возврате из фоновой вкладки.
+    // Значит, повторные паузы >250 мс — это медленный рендер, а не сон вкладки.
+    if (dt > 250) {
+      this.perf.n = 0; this.perf.sum = 0;
+      if (++this.perf.slow >= 2) {
+        const cap = Math.max(320, Math.floor((this.pxW * 0.75) / 64) * 64);
+        if (cap < this.qualityCap) {
+          this.qualityCap = cap;
+          this.applySize();
+        }
+        this.perf.slow = 0;
+      }
+      return;
+    }
+    this.perf.slow = 0;
     this.perf.n++;
     if (this.perf.n <= 20) return; // компиляция шейдеров, прогрев
     this.perf.sum += dt;
@@ -1113,21 +1229,25 @@ export class Intro {
 
   frame() {
     this.adaptQuality();
+    const previousTime = this.t;
+    let frameDelta = 1 / this.cfg.general.fps;
     if (this.freeze !== null) this.t = this.freeze;
     else if (this.playing) {
       // первый кадр после play/seek: якорим время, чтобы долгий кадр (загрузка/компиляция) не сдвигал таймлайн
-      if (this.anchorPending) { this.startAt = performance.now() - this.anchor * 1000; this.anchorPending = false; }
+      const firstFrame = this.anchorPending;
+      if (firstFrame) { this.startAt = performance.now() - this.anchor * 1000; this.anchorPending = false; }
       this.t = (performance.now() - this.startAt) / 1000;
+      if (!firstFrame && this.t > previousTime) frameDelta = this.t - previousTime;
     }
     // Зацикливание: в конце ролик гаснет (0.45 с), поэтому переход на новый круг не выглядит
-    // как «камера ушла в черноту» — кадр уходит в чёрный плавно, вместе со звуком.
+    // как «камера ушла в черноту» — кадр уходит в чёрный плавно.
     const tail = this.duration;
     if (this.playing && this.freeze === null && this.cfg.general.loop && this.t > tail + 0.35) {
-      this.onLoop?.();
       this.play(0);
       this.t = 0;
+      frameDelta = 1 / this.cfg.general.fps;
     }
-    this.update(this.t);
+    this.update(this.t, frameDelta);
     try {
       this.composer.render();
       this.renderFails = 0;
@@ -1146,8 +1266,9 @@ export class Intro {
     return real < g.impact ? real * (DESIGN_IMPACT / g.impact) : DESIGN_IMPACT + (real - g.impact) * g.speed;
   }
 
-  update(real: number) {
-    this.updateDesign(this.warp(real), real);
+  update(real: number, frameDelta = 1 / this.cfg.general.fps) {
+    const frameStep = Math.max(1 / this.cfg.general.fps, frameDelta);
+    this.updateDesign(this.warp(real), real, frameStep);
   }
 
   setCol(c, hex) {
@@ -1155,7 +1276,7 @@ export class Intro {
   }
 
   /** t — «проектное» время (удар всегда в 4.5 с), real — реальное время ролика. */
-  updateDesign(t: number, real: number) {
+  updateDesign(t: number, real: number, frameDelta = 1 / this.cfg.general.fps) {
     const C = this.cfg, G = C.general, CM = C.camera, PO = C.post, LY = C.layers;
     const BG = LY.background, LG = LY.logo, CP = LY.compass, TT = LY.title, SB = LY.subtitle, DT = LY.date;
     const DV = LY.dividers, RG = LY.rings, PT = LY.particles, FX = LY.fx;
@@ -1200,7 +1321,7 @@ export class Intro {
     const fadeIn = 0.3 + 0.7 * easeOutCubic(seg(t, 0, this.loopRound ? 0.4 : 1.0));
     const F = this.fp.uniforms;
     const dip = 0.3 * easeInOutSine(seg(t, 4.1, 4.48)) * (t < 4.5 ? 1 : 0);
-    // в экспортируемом видео картинка уходит в чёрный вместе со звуком;
+    // в экспортируемом видео картинка уходит в чёрный вместе с финальным кадром;
     // в превью с зацикливанием — тоже, иначе круг обрывается резким чёрным кадром
     const dur = this.duration;
     // Экспорт — честный уход в чёрный; превью с зацикливанием — «провал в темень» до 12 %
@@ -1402,28 +1523,51 @@ export class Intro {
 
     // dividers
     const dt = lt('dividers');
-    const dd = DV.duration, d2 = dd * 0.815;
-    const placeLine = (m, dy, f) => {
+    const d1 = DV.duration * DV.duration1;
+    const d2 = DV.duration * DV.duration2;
+    const placeLine = (m, dy, length) => {
       const ln = m.userData.line;
-      m.scale.x = f;
-      m.position.x = ln.inner - ln.dir * (ln.w * f) / 2;
+      m.scale.x = length;
+      m.scale.y = DV.thickness;
+      m.position.x = ln.inner - ln.dir * (ln.w * length) / 2;
       m.position.y = m.userData.baseY + dy;
     };
-    const showLines = (d, on) => { d.L.visible = d.R.visible = on; };
-    const l1 = easeInOutCubic(seg(dt, DV.start1, DV.start1 + dd));
+    const updateLinePair = (d, progress, alpha, dy, length) => {
+      d.L.visible = d.R.visible = DV.enabled && alpha > 0 && progress > 0;
+      [d.L, d.R].forEach((m) => {
+        const u = m.material.uniforms;
+        u.uProg.value = progress;
+        u.uAlpha.value = DV.intensity * alpha;
+        u.uCore.value = DV.core;
+        u.uGlow.value = DV.glow;
+        u.uHighlight.value = DV.highlight;
+        this.setCol(u.uColor.value, DV.color);
+        this.setCol(u.uHotColor.value, DV.hotColor);
+        placeLine(m, dy, DV.width * length);
+      });
+    };
+    const l1 = easeInOutCubic(seg(dt, DV.start1, DV.start1 + d1));
     const on1 = DV.enabled && DV.first;
-    showLines(this.div1, on1 && l1 > 0);
-    [this.div1.L, this.div1.R].forEach((m) => { m.material.uniforms.uProg.value = l1; m.material.uniforms.uAlpha.value = DV.intensity; placeLine(m, DV.y1, DV.width); });
+    updateLinePair(this.div1, l1, on1 ? DV.intensity1 : 0, DV.y1, DV.length1);
     this.popDiamond(this.div1.d, seg(dt, DV.start1 - 0.1, DV.start1 + 0.6), t, 0);
     this.div1.d.visible = this.div1.d.visible && on1 && DV.diamonds;
     this.div1.d.position.y = this.div1.d.userData.baseY + DV.y1;
     const l2 = easeInOutCubic(seg(dt, DV.start2, DV.start2 + d2));
     const on2 = DV.enabled && DV.second;
-    showLines(this.div2, on2 && l2 > 0);
-    [this.div2.L, this.div2.R].forEach((m) => { m.material.uniforms.uProg.value = l2; m.material.uniforms.uAlpha.value = DV.intensity; placeLine(m, DV.y2, DV.width); });
+    updateLinePair(this.div2, l2, on2 ? DV.intensity2 : 0, DV.y2, DV.length2);
     this.popDiamond(this.div2.d, seg(dt, DV.start2 - 0.1, DV.start2 + 0.55), t, 1.7);
     this.div2.d.visible = this.div2.d.visible && on2 && DV.diamonds;
     this.div2.d.position.y = this.div2.d.userData.baseY + DV.y2;
+
+    // The bars bypass animated HDR extraction and final-pass grain; reapply only the
+    // global fade, vignette and opening slit so their look stays in sync with the scene.
+    this.dividerOverlay.enabled = DV.enabled && (this.div1.L.visible || this.div2.L.visible);
+    const du = this.dividerOverlay.material.uniforms;
+    du.uAspect.value = this.camera.aspect;
+    du.uVignette.value = PO.vignette;
+    du.uFade.value = F.uFade.value;
+    du.uOpen.value = F.uOpen.value;
+    du.uSlitMix.value = F.uSlitMix.value;
 
     // subtitle + date
     this.updateText(this.sub, SB, t, 1.3, 0, 0.55, 0.25);
@@ -1455,34 +1599,33 @@ export class Intro {
     // то есть кольцо обгоняло само себя и стробоскопило (заметно с 8.1 с, затухая до ~9.6 с).
     // Теперь: ширина задаётся в мировых единицах и не зависит от пропорций плоскости,
     // кольца шире, мягче и растут медленнее.
+    // Предыдущий радиус считаем по явному шагу кадра, без скрытой истории рендеров:
+    // перемотка/экспорт используют 1/fps, а живое превью учитывает фактический пропуск кадров.
+    const prevT = this.warp(Math.max(0, real - frameDelta));
     const w1 = seg(t, 4.5, 6.1);
+    const w1Prev = seg(prevT, 4.5, 6.1);
     this.waveLogo.position.set(lcx, lcy, 0.3);
     this.waveLogo.visible = w1 > 0 && w1 < 1 && fxk(FX.waves) > 0;
     // плоскость 34×34 (квадрат, uAspect = 1): радиус в мировых единицах, ширина растёт с радиусом
     this.waveLogo.material.uniforms.uR.value = (easeOutCubic(w1) * 9.2) / 17;
+    this.waveLogo.material.uniforms.uPrevR.value = (easeOutCubic(w1Prev) * 9.2) / 17;
     this.waveLogo.material.uniforms.uA.value = Math.pow(1 - w1, 1.5) * 0.3 * (0.45 + 0.55 * seg(w1, 0, 0.12)) * fxk(FX.waves);
     this.waveLogo.material.uniforms.uW.value = (0.26 + w1 * 0.75) / 17;
     const w2 = seg(t - ts, 7.75, 9.4);
+    const w2Prev = seg(prevT - ts, 7.75, 9.4);
+    const titleWaveRadius = (w: number) => (0.35 * (1 - Math.pow(1 - w, 1.6)) + 0.65 * w) * 1.1;
+    const titleWaveGain = fxk(FX.waves) * FX.titleWave;
     this.waveTitle.position.set(TT.x, -0.66 + TT.y, 0.3);
-    this.waveTitle.visible = w2 > 0 && w2 < 1 && fxk(FX.waves) > 0;
+    this.waveTitle.visible = w2 > 0 && w2 < 1 && titleWaveGain > 0;
     // плоскость 26×9 (uAspect = 2.89): кольцо остаётся круглым, кромка по горизонтали
     // больше не тоньше вертикальной в 2.9 раза — именно она мигала на быстром расширении
     // Равномерное расширение вместо easeOutCubic: у кубической кривой скорость в начале втрое
     // выше средней — отсюда стробоскоп на первых кадрах (8.0–8.3 с). Здесь пиковая скорость
     // меньше, а широкий мягкий фронт успевает «пропечататься» на каждом кадре.
-    this.waveTitle.material.uniforms.uR.value = (0.35 * (1 - Math.pow(1 - w2, 1.6)) + 0.65 * w2) * 1.1;
-    this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.3) * 0.24 * fxk(FX.waves);
+    this.waveTitle.material.uniforms.uR.value = titleWaveRadius(w2);
+    this.waveTitle.material.uniforms.uPrevR.value = titleWaveRadius(w2Prev);
+    this.waveTitle.material.uniforms.uA.value = Math.pow(1 - w2, 1.3) * 0.24 * titleWaveGain;
     this.waveTitle.material.uniforms.uW.value = 0.09 + w2 * 0.12;
-    // uPrevR — радиус прошлого кадра, чтобы шейдер залил путь кромки (антиалиасинг по времени).
-    // Важно: след ограничен сверху (не больше 0.16 радиуса) и обнуляется, когда волна скрыта —
-    // иначе на старте нового круга prevR остаётся от прошлого прогона и вспыхивает весь диск.
-    for (const wm of [this.waveLogo, this.waveTitle]) {
-      const u = wm.material.uniforms;
-      const R = u.uR.value;
-      const prev = wm.visible ? Math.min(R, Math.max(wm.userData.prevR ?? R, R - 0.16)) : R;
-      u.uPrevR.value = prev;
-      wm.userData.prevR = R;
-    }
 
     // анаморфные полосы: нарастают к удару, вспыхивают на нём, оживают на названии и финальном блике
     this.streak.strength = PO.streak * Math.min(1.1,
@@ -1576,7 +1719,7 @@ export class Intro {
     const geometries = new Set();
     const materials = new Set();
     const textures = new Set();
-    this.scene?.traverse((obj) => {
+    [this.scene, this.dividerScene].filter(Boolean).forEach((scene) => scene.traverse((obj) => {
       if (obj.geometry) geometries.add(obj.geometry);
       const list = Array.isArray(obj.material) ? obj.material : [obj.material];
       list.filter(Boolean).forEach((material) => {
@@ -1586,7 +1729,7 @@ export class Intro {
           if (uniform?.value?.isTexture) textures.add(uniform.value);
         });
       });
-    });
+    }));
     this.environmentTarget?.dispose();
     this.environmentTarget = null;
     if (this.scene) this.scene.environment = null;

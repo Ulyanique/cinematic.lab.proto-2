@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Intro } from './intro/Intro';
-import { ScorePlayer } from './intro/audio';
 import { DEFAULT_CONFIG, DESIGN_IMPACT, cloneConfig, sanitizeConfig, setPath, totalDuration, type Config } from './intro/config';
 import { CompositionPanel, GearIcon, LayersIcon, SettingsPanel, type Tab } from './ui/Panels';
 
@@ -37,9 +36,7 @@ export default function App() {
   const recordingRef = useRef(false);
   const [uiVisible, setUiVisible] = useState(true);
   const hideTimer = useRef<number>(0);
-  const scoreRef = useRef<ScorePlayer | null>(null);
   const timeRef = useRef<HTMLSpanElement>(null);
-  const [sound, setSound] = useState(false);
   const [paused, setPaused] = useState(false);
   const pausedRef = useRef(false);
 
@@ -61,15 +58,11 @@ export default function App() {
     const host = hostRef.current!;
     const intro = new Intro(host, cfgRef.current);
     introRef.current = intro;
-    const score = new ScorePlayer();
-    scoreRef.current = score;
-    (window as any).__score = score;
     let dead = false;
     intro.onContextLost = () => {
       if (!dead) setError('Видеокарта сбросила WebGL. Обновите страницу или закройте другие вкладки с 3D-графикой.');
     };
     intro.onWarn = (m) => { if (!dead) setWarn(m); };
-    intro.onLoop = () => score.start(0);
     intro
       .init()
       .then(() => {
@@ -94,30 +87,16 @@ export default function App() {
       });
     return () => {
       dead = true;
-      score.dispose();
-      scoreRef.current = null;
       intro.dispose();
       if (introRef.current === intro) introRef.current = null;
       if ((window as any).__intro === intro) delete (window as any).__intro;
     };
   }, []);
 
-  // конфигурация → движок и звук; сохранение в localStorage
-  const resync = useRef<number>(0);
+  // конфигурация → движок; сохранение в localStorage
   useEffect(() => {
     const intro = introRef.current;
-    if (intro && ready) {
-      intro.setConfig(cfg);
-      const g = cfg.general;
-      const score = scoreRef.current;
-      if (score) {
-        score.setTiming(g.impact, g.speed, totalDuration(cfg), g.volume);
-        window.clearTimeout(resync.current);
-        resync.current = window.setTimeout(() => {
-          if (score.enabled && !pausedRef.current && !recordingRef.current) score.start(introRef.current?.t ?? 0);
-        }, 450);
-      }
-    }
+    if (intro && ready) intro.setConfig(cfg);
     const id = window.setTimeout(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(cfg)); } catch { /* квота */ } }, 300);
     return () => window.clearTimeout(id);
   }, [cfg, ready]);
@@ -134,7 +113,6 @@ export default function App() {
     pausedRef.current = false;
     setPaused(false);
     introRef.current?.play(0);
-    scoreRef.current?.start(0);
   }, []);
 
   const togglePause = useCallback(() => {
@@ -144,12 +122,10 @@ export default function App() {
       pausedRef.current = false;
       setPaused(false);
       intro.play(Math.min(intro.t, intro.duration));
-      scoreRef.current?.start(intro.t);
     } else {
       pausedRef.current = true;
       setPaused(true);
       intro.freeze = intro.t;
-      scoreRef.current?.stop();
     }
   }, []);
 
@@ -157,23 +133,6 @@ export default function App() {
     if (document.fullscreenElement) document.exitFullscreen();
     else rootRef.current?.requestFullscreen?.();
   };
-
-  const toggleSound = useCallback(async () => {
-    const score = scoreRef.current;
-    if (!score) return;
-    if (score.enabled) {
-      score.disable();
-      setSound(false);
-    } else {
-      try {
-        await score.enable();
-        setSound(true);
-        if (!pausedRef.current) score.start(introRef.current?.t ?? 0);
-      } catch (e) {
-        console.error(e);
-      }
-    }
-  }, []);
 
   useEffect(() => {
     poke();
@@ -188,12 +147,11 @@ export default function App() {
       }
       if (e.code === 'KeyP') togglePause();
       if (e.code === 'KeyF') toggleFs();
-      if (e.code === 'KeyM') toggleSound();
       if (e.key === 'Escape') { setOpenSettings(false); setOpenComp(false); }
     };
     window.addEventListener('keydown', onKey);
     return () => { window.removeEventListener('keydown', onKey); window.clearTimeout(hideTimer.current); };
-  }, [poke, replay, togglePause, toggleSound]);
+  }, [poke, replay, togglePause]);
 
   const seekTo = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const intro = introRef.current;
@@ -202,19 +160,7 @@ export default function App() {
     const time = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * intro.duration;
     if (pausedRef.current) { intro.freeze = time; intro.t = time; return; }
     intro.seek(time);
-    scoreRef.current?.start(time);
   }, []);
-
-  // браузеры запрещают автозвук: первый клик по сцене включает саундтрек (клики по панелям не считаются)
-  useEffect(() => {
-    const onFirst = (e: PointerEvent) => {
-      if (e.target instanceof HTMLElement && e.target.closest('button,a,video,input,select,textarea,label,[role=slider],[data-panel]')) return;
-      window.removeEventListener('pointerdown', onFirst, true);
-      if (!scoreRef.current?.enabled) toggleSound();
-    };
-    window.addEventListener('pointerdown', onFirst, true);
-    return () => window.removeEventListener('pointerdown', onFirst, true);
-  }, [toggleSound]);
 
   const record = async () => {
     const intro = introRef.current;
@@ -223,15 +169,10 @@ export default function App() {
     setRecording(true);
     setRecordError(null);
     setProgress(0);
-    const score = scoreRef.current;
-    score?.stop();
     try {
       const g = cfgRef.current.general;
-      score?.setTiming(g.impact, g.speed, totalDuration(cfgRef.current), g.volume);
-      const audio = g.exportAudio ? await (score ?? new ScorePlayer()).getBuffer() : undefined;
-      const blob = await intro.record(setProgress, audio);
+      const blob = await intro.record(setProgress);
       const extension = blob.type === 'video/mp4' ? 'mp4' : 'webm';
-      if (audio && !intro.lastExportHadAudio) setRecordError('Видео создано без звука: браузер не поддерживает аудиокодек для экспорта.');
       setVideo({ url: URL.createObjectURL(blob), name: `${(g.fileName || 'intro').replace(/[^\w.\-а-яА-ЯёЁ ]+/g, '_')}.${extension}` });
     } catch (e) {
       console.error(e);
@@ -239,7 +180,6 @@ export default function App() {
     } finally {
       recordingRef.current = false;
       setRecording(false);
-      if (!pausedRef.current) score?.start(intro.t);
     }
   };
 
@@ -334,14 +274,6 @@ export default function App() {
               <RoundBtn label="Настройки" active={openSettings} onClick={() => setOpenSettings((v) => !v)}><GearIcon /></RoundBtn>
             </div>
 
-            {!sound && (
-              <button
-                onClick={toggleSound}
-                className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 text-[10px] tracking-[0.3em] uppercase rounded-full border border-amber-300/30 text-amber-100/80 bg-black/40 backdrop-blur-md animate-pulse hover:border-amber-300/70 transition"
-              >
-                <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="M15.5 8.5a5 5 0 0 1 0 7" />} /> Включить звук
-              </button>
-            )}
             {recordError && <div role="alert" className="absolute top-16 left-4 right-4 text-center text-amber-100 bg-black/80 p-3 text-sm">{recordError}</div>}
             <div
               onFocus={() => { window.clearTimeout(hideTimer.current); setUiVisible(true); }}
@@ -353,10 +285,6 @@ export default function App() {
               <Btn onClick={replay} disabled={recording}><Icon d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5" /> Повторить</Btn>
               <Btn onClick={togglePause} disabled={recording} active={paused}>
                 {paused ? <Icon d="M7 4v16l13-8z" /> : <Icon d="M8 5v14M16 5v14" />} {paused ? 'Продолжить' : 'Пауза'}
-              </Btn>
-              <Btn onClick={toggleSound} active={sound}>
-                {sound ? <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" />} /> : <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="m22 9-6 6m0-6 6 6" />} />}
-                Звук
               </Btn>
               <Btn onClick={record} disabled={recording}>
                 <Icon d="M12 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0" extra={<circle cx="12" cy="12" r="9" />} />

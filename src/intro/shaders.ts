@@ -256,22 +256,24 @@ void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,
 `;
 export const lineFrag = /* glsl */ `
 precision highp float;
-uniform float uProg, uDir, uTime, uAlpha;
+uniform float uProg, uDir, uAlpha, uCore, uGlow, uHighlight;
+uniform vec3 uColor, uHotColor;
 varying vec2 vUv;
 void main(){
   // t: 0 at the diamond end, 1 at outer end
   float t=uDir>0.?(1.-vUv.x):vUv.x;
   float vy=abs(vUv.y-.5)*2.;
-  float draw=(1.-smoothstep(uProg-0.06, uProg, t));
-  float headDist=(t-uProg)*18.;
-  float head=exp(-headDist*headDist)*step(uProg,0.999)*step(0.001,uProg);
-  float core=exp(-vy*vy*70.);
-  float glow=exp(-vy*5.)*0.14;
+  // Derivative-based edge width keeps the core stable when it is less than one preview pixel.
+  float aa=max(fwidth(vy),0.002);
+  float core=1.-smoothstep(uCore-aa,uCore+aa,vy);
+  float glow=exp(-vy*5.)*uGlow;
   float grad=pow(1.-t,0.55)*0.9+0.1;
-  float sheen=0.6+0.4*sin(t*7.-uTime*1.4);
-  float a=(core+glow)*draw*grad*sheen+head*(core*2.+glow*3.);
-  vec3 col=mix(vec3(1.,0.7,0.28), vec3(1.,0.9,0.62), core);
-  gl_FragColor=vec4(col*2.0, a*uAlpha);
+  // Optional broad head; zero by default. Its width follows the screen-space pixel footprint.
+  float headWidth=max(fwidth(t)*3.,0.012);
+  float head=exp(-pow((t-uProg)/headWidth,2.))*step(0.001,uProg)*step(uProg,0.999);
+  float a=(core+glow)*uProg*grad+(core+glow*3.)*head*uHighlight;
+  vec3 col=mix(uColor,uHotColor,core);
+  gl_FragColor=vec4(col*2.,a*uAlpha);
 }
 `;
 
@@ -314,17 +316,20 @@ void main(){
   float d=length(c);
   float x=(d-uR)/uW;
   // резкий передний фронт, длинный мягкий шлейф позади, тонкое раскалённое ядро
-  float lead=exp(-x*x*7.)*step(0.,x)+exp(-x*x*60.)*step(x,0.);
+  // Узкий внутренний фронт и «ядро» были субпиксельными у начала волны (около 8 с):
+  // движение на кадр перескакивало яркий пик. Расширяем профиль, чтобы он не стробил.
+  float lead=exp(-x*x*7.)*step(0.,x)+exp(-x*x*24.)*step(x,0.);
   float tail=exp(x*0.85)*step(x,0.)*0.34;
-  float core=exp(-x*x*140.);
+  float core=exp(-x*x*18.);
   // мягкий «подшёрсток»: широкое гало вокруг кольца — переход остаётся видимым даже когда
   // кольцо за кадр смещается на много пикселей (иначе появляется стробоскоп на быстром фронте)
   float skirt=exp(-x*x*1.6)*0.22;
   // Временной антиалиасинг: за один кадр кромка успевает уехать на несколько пикселей,
-  // и глаз видит стробоскоп. Заливаем весь путь кромки от прошлого кадра (uPrevR) — кольцо
-  // остаётся сплошным на любой скорости, как след движущегося источника света.
-  float trail = step(uR, uPrevR) * step(d, uPrevR) * step(uR, d);
-  skirt += trail * 0.10;
+  // и глаз видит стробоскоп. При расширении uPrevR меньше uR; заливаем путь между радиусами.
+  float deltaR = uR - uPrevR;
+  float trail = step(0.0001, deltaR) * step(uPrevR, d) * step(d, uR);
+  float trailGain = mix(0.10, 0.65, smoothstep(0.025, 0.18, deltaR));
+  skirt += trail * trailGain;
   // мягкая маска у границ плоскости: кольцо никогда не упирается в «квадратный» край
   // маска считается по НЕисправленным координатам: иначе свет упирается в прямоугольный
   // край плоскости волны и появляется резкая горизонтальная полоса
