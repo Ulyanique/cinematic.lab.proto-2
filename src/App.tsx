@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Intro } from './intro/Intro';
+import { Intro, type ClipMode } from './intro/Intro';
 import { DEFAULT_CONFIG, DESIGN_IMPACT, cloneConfig, sanitizeConfig, setPath, totalDuration, type Config } from './intro/config';
 import { CompositionPanel, GearIcon, LayersIcon, SettingsPanel, type Tab } from './ui/Panels';
 
@@ -14,6 +14,11 @@ function loadConfig(): Config {
 }
 
 const fmt = (t: number) => `${t.toFixed(1)}`;
+const CLIP_OPTIONS: [ClipMode, string][] = [
+  ['intro', 'Интро'],
+  ['outro', 'Аутро · обратная анимация'],
+  ['background', 'Фон · логотип и название'],
+];
 
 const Icon = ({ d, extra }: { d: string; extra?: React.ReactNode }) => (
   <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -39,6 +44,7 @@ export default function App() {
   const timeRef = useRef<HTMLSpanElement>(null);
   const [paused, setPaused] = useState(false);
   const pausedRef = useRef(false);
+  const [clipMode, setClipMode] = useState<ClipMode>('intro');
 
   const [cfg, setCfgState] = useState<Config>(loadConfig);
   const cfgRef = useRef(cfg);
@@ -115,6 +121,13 @@ export default function App() {
     introRef.current?.play(0);
   }, []);
 
+  const changeClipMode = useCallback((mode: ClipMode) => {
+    setClipMode(mode);
+    pausedRef.current = false;
+    setPaused(false);
+    introRef.current?.setClipMode(mode);
+  }, []);
+
   const togglePause = useCallback(() => {
     const intro = introRef.current;
     if (!intro || recordingRef.current) return;
@@ -173,7 +186,10 @@ export default function App() {
       const g = cfgRef.current.general;
       const blob = await intro.record(setProgress);
       const extension = blob.type === 'video/mp4' ? 'mp4' : 'webm';
-      setVideo({ url: URL.createObjectURL(blob), name: `${(g.fileName || 'intro').replace(/[^\w.\-а-яА-ЯёЁ ]+/g, '_')}.${extension}` });
+      const configuredStem = g.fileName.trim();
+      const stem = (configuredStem || clipMode).replace(/[^\w.\-а-яА-ЯёЁ ]+/g, '_');
+      const suffix = clipMode === 'intro' || !configuredStem ? '' : `-${clipMode}`;
+      setVideo({ url: URL.createObjectURL(blob), name: `${stem}${suffix}.${extension}` });
     } catch (e) {
       console.error(e);
       setRecordError(e instanceof Error ? e.message : String(e));
@@ -188,7 +204,7 @@ export default function App() {
   const duration = totalDuration(cfg);
   const real = (tau: number) => (tau < DESIGN_IMPACT ? (tau * g.impact) / DESIGN_IMPACT : g.impact + (tau - DESIGN_IMPACT) / g.speed);
   const L = cfg.layers;
-  const chapters = [
+  const storyChapters = [
     { t: real(1.05), label: 'Свет' },
     { t: g.impact, label: 'Эмблема' },
     { t: real(L.title.start + L.title.delay), label: 'Название' },
@@ -196,6 +212,10 @@ export default function App() {
     { t: real(L.date.start + L.date.delay), label: 'Дата' },
     { t: real(10.9), label: 'Блик' },
   ].filter((c) => c.t >= 0 && c.t <= duration);
+  const chapters = clipMode === 'background' ? [] : storyChapters.map((c) => ({
+    ...c,
+    t: clipMode === 'outro' ? duration - c.t : c.t,
+  }));
   const EW = Math.round(g.width / 2) * 2, EH = Math.round((EW * 9) / 16 / 2) * 2;
 
   const openLayerSettings = (id: string) => { setSelected(id); setTab('layer'); setOpenSettings(true); };
@@ -251,7 +271,7 @@ export default function App() {
               onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); seekTo(e); }}
               onPointerMove={(e) => { if (e.buttons) seekTo(e); }}
               role="slider"
-              aria-label="Позиция в интро"
+              aria-label={`Позиция: ${CLIP_OPTIONS.find(([mode]) => mode === clipMode)?.[1] || 'ролик'}`}
               aria-valuemin={0}
               aria-valuemax={Math.round(duration)}
             >
@@ -262,6 +282,27 @@ export default function App() {
                     <span className="absolute bottom-3 -translate-x-1/2 whitespace-nowrap text-[9px] tracking-[0.25em] uppercase text-amber-100/0 group-hover:text-amber-100/70 transition-colors">{c.label}</span>
                   </div>
                 ))}
+              </div>
+            </div>
+
+            <div
+              className="absolute left-4 right-24 top-4 z-30 flex justify-center transition-opacity duration-500"
+              style={{ opacity: uiVisible || panelOpen ? 1 : 0, pointerEvents: uiVisible || panelOpen ? 'auto' : 'none' }}
+            >
+              <label htmlFor="clip-mode" className="sr-only">Выбор ролика</label>
+              <div className="relative w-full max-w-xs min-w-0">
+                <select
+                  id="clip-mode"
+                  aria-label="Тип ролика"
+                  value={clipMode}
+                  disabled={recording}
+                  onChange={(e) => changeClipMode(e.target.value as ClipMode)}
+                  className="w-full max-w-full appearance-none truncate rounded-full border border-amber-300/35 bg-black/70 py-2 pl-4 pr-9 text-[10px] tracking-[0.2em] uppercase text-amber-100/90 shadow-lg backdrop-blur-md outline-none transition hover:border-amber-300/70 focus:border-amber-300/70 disabled:opacity-50"
+                  style={{ colorScheme: 'dark', maxWidth: '100%' }}
+                >
+                  {CLIP_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-amber-100/60" aria-hidden>⌄</span>
               </div>
             </div>
 
