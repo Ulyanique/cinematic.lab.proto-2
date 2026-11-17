@@ -16,4 +16,13 @@ export default defineConfig({
       "@": path.resolve(__dirname, "src"),
     },
   },
+  // dev-сервер запускается в песочнице и открывается через прокси-хост превью:
+  // слушаем все интерфейсы и разрешаем произвольный Host (иначе Vite блокирует запросы).
+  server: {
+    host: "0.0.0.0",
+    port: 5173,
+    strictPort: true,
+    allowedHosts: true,
+    hmr: { clientPort: 443 },
+  },
 });

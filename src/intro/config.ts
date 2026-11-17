@@ -13,7 +13,7 @@ export const DEFAULT_CONFIG = {
   order: [...DEFAULT_ORDER] as LayerId[],
   general: {
     impact: 4.5, speed: 1, hold: 0,
-    volume: 0.75, exportAudio: true, fadeOut: true,
+    fadeOut: true,
     fps: 30, width: 1920, bitrate: 16, quality: 1920,
     loop: false, fileName: 'intro',
   },
@@ -57,11 +57,14 @@ export const DEFAULT_CONFIG = {
     },
     dividers: {
       enabled: true, delay: 0, first: true, second: true, diamonds: true,
-      y1: 0, y2: 0, width: 1, intensity: 1, start1: 8.05, start2: 9.4, duration: 1.35,
+      width: 1, intensity: 1, thickness: 1.2, core: 0.1, glow: 0.14, highlight: 0,
+      color: '#ffb95e', hotColor: '#fff1c9',
+      length1: 1, length2: 1, intensity1: 1, intensity2: 1, duration1: 1, duration2: 0.815,
+      y1: 0, y2: 0, start1: 8.05, start2: 9.4, duration: 1.35,
     },
     rings: { enabled: true, delay: 0, opacity: 1, speed: 1, scale: 1, nodes: true },
     particles: { enabled: true, delay: 0, dust: 1, bokeh: 1, size: 1, speed: 1, brightness: 1 },
-    fx: { enabled: true, flash: 1, shock: 1, flares: 1, glints: 1, sweep: 1, rays: 1, waves: 1 },
+    fx: { enabled: true, flash: 1, shock: 1, flares: 1, glints: 1, sweep: 1, rays: 1, waves: 1, titleWave: 0 },
   },
 };
 
@@ -190,14 +193,10 @@ const gold = [color('deep', 'Золото: тень'), color('mid', 'Золот�
 export const SCHEMA: Record<string, Section[]> = {
   general: [
     { title: 'Время', fields: [
-      num('impact', 'Момент удара (эмблема)', 1.5, 9, 0.05, { unit: 'с', hint: 'Центральное событие: вспышка, ударная волна, звук' }),
+      num('impact', 'Момент удара (эмблема)', 1.5, 9, 0.05, { unit: 'с', hint: 'Центральное событие: вспышка и ударная волна' }),
       num('speed', 'Скорость после удара', 0.5, 2.5, 0.05, { unit: '×' }),
       num('hold', 'Финальная пауза', 0, 10, 0.1, { unit: 'с' }),
       bool('loop', 'Зацикливать превью'),
-    ] },
-    { title: 'Звук', fields: [
-      num('volume', 'Громкость', 0, 1, 0.01),
-      bool('exportAudio', 'Звук в экспортируемом видео'),
     ] },
     { title: 'Экспорт видео', fields: [
       text('fileName', 'Имя файла', false),
@@ -321,12 +320,24 @@ export const SCHEMA: Record<string, Section[]> = {
   subtitle: [textSection('Подзаголовок'), textAnim()],
   date: [textSection('Дата'), textAnim()],
   dividers: [
-    { title: 'Разделители', fields: [
-      bool('first', 'Верхний'), bool('second', 'Нижний'), bool('diamonds', 'Ромбы'),
-      num('width', 'Длина', 0.2, 2, 0.01), num('intensity', 'Яркость', 0, 2, 0.02),
-      num('y1', 'Верхний: смещение Y', -2, 2, 0.02), num('y2', 'Нижний: смещение Y', -2, 2, 0.02),
-      num('start1', 'Старт верхнего', 0, 12, 0.05, { unit: 'с' }), num('start2', 'Старт нижнего', 0, 12, 0.05, { unit: 'с' }),
-      num('duration', 'Длительность', 0.2, 4, 0.05, { unit: 'с' }), num('delay', 'Сдвиг слоя', -3, 5, 0.05, { unit: 'с' }),
+    { title: 'Общие', fields: [
+      bool('first', 'Показывать верхний'), bool('second', 'Показывать нижний'), bool('diamonds', 'Ромбы'),
+      num('width', 'Общая длина', 0.2, 2, 0.01), num('intensity', 'Общая яркость', 0, 2, 0.02),
+      num('thickness', 'Толщина линии', 0.3, 3, 0.05), num('core', 'Ширина ядра', 0.03, 0.35, 0.01),
+      num('glow', 'Свечение вокруг линии', 0, 0.8, 0.02), num('highlight', 'Бегущий блик', 0, 2, 0.05),
+      color('color', 'Цвет линии'), color('hotColor', 'Цвет ядра'),
+      num('duration', 'Общая длительность', 0.2, 4, 0.05, { unit: 'с' }),
+      num('delay', 'Сдвиг слоя', -3, 5, 0.05, { unit: 'с' }),
+    ] },
+    { title: 'Верхний разделитель', fields: [
+      num('length1', 'Длина, ×', 0.2, 2, 0.02), num('intensity1', 'Яркость, ×', 0, 2, 0.02),
+      num('duration1', 'Длительность, ×', 0.2, 2.5, 0.05),
+      num('y1', 'Смещение Y', -2, 2, 0.02), num('start1', 'Старт', 0, 12, 0.05, { unit: 'с' }),
+    ] },
+    { title: 'Нижний разделитель', fields: [
+      num('length2', 'Длина, ×', 0.2, 2, 0.02), num('intensity2', 'Яркость, ×', 0, 2, 0.02),
+      num('duration2', 'Длительность, ×', 0.2, 2.5, 0.05),
+      num('y2', 'Смещение Y', -2, 2, 0.02), num('start2', 'Старт', 0, 12, 0.05, { unit: 'с' }),
     ] },
   ],
   rings: [
@@ -345,7 +356,8 @@ export const SCHEMA: Record<string, Section[]> = {
   fx: [
     { title: 'Световые эффекты', fields: [
       num('flash', 'Вспышка и ядро', 0, 3, 0.05), num('shock', 'Ударная волна', 0, 3, 0.05),
-      num('waves', 'Кольцевые волны', 0, 3, 0.05), num('flares', 'Анаморфные блики', 0, 3, 0.05),
+      num('waves', 'Кольцевые волны', 0, 3, 0.05), num('titleWave', 'Волна под названием', 0, 1, 0.05),
+      num('flares', 'Анаморфные блики', 0, 3, 0.05),
       num('glints', 'Звёздные блики', 0, 3, 0.05), num('sweep', 'Бегущий свет по золоту', 0, 3, 0.05),
       num('rays', 'Лучи из эмблемы', 0, 4, 0.05),
     ] },

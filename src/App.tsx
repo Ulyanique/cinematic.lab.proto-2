@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Intro } from './intro/Intro';
-import { ScorePlayer } from './intro/audio';
+import { Intro, OUTRO_CREDITS_DURATION, type ClipMode } from './intro/Intro';
 import { DEFAULT_CONFIG, DESIGN_IMPACT, cloneConfig, sanitizeConfig, setPath, totalDuration, type Config } from './intro/config';
 import { CompositionPanel, GearIcon, LayersIcon, SettingsPanel, type Tab } from './ui/Panels';
 
@@ -15,6 +14,11 @@ function loadConfig(): Config {
 }
 
 const fmt = (t: number) => `${t.toFixed(1)}`;
+const CLIP_OPTIONS: [ClipMode, string][] = [
+  ['intro', 'Интро'],
+  ['outro', 'Аутро · обратная анимация'],
+  ['background', 'Фон · зацикленный финал интро'],
+];
 
 const Icon = ({ d, extra }: { d: string; extra?: React.ReactNode }) => (
   <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -37,11 +41,10 @@ export default function App() {
   const recordingRef = useRef(false);
   const [uiVisible, setUiVisible] = useState(true);
   const hideTimer = useRef<number>(0);
-  const scoreRef = useRef<ScorePlayer | null>(null);
   const timeRef = useRef<HTMLSpanElement>(null);
-  const [sound, setSound] = useState(false);
   const [paused, setPaused] = useState(false);
   const pausedRef = useRef(false);
+  const [clipMode, setClipMode] = useState<ClipMode>('intro');
 
   const [cfg, setCfgState] = useState<Config>(loadConfig);
   const cfgRef = useRef(cfg);
@@ -61,15 +64,11 @@ export default function App() {
     const host = hostRef.current!;
     const intro = new Intro(host, cfgRef.current);
     introRef.current = intro;
-    const score = new ScorePlayer();
-    scoreRef.current = score;
-    (window as any).__score = score;
     let dead = false;
     intro.onContextLost = () => {
       if (!dead) setError('Видеокарта сбросила WebGL. Обновите страницу или закройте другие вкладки с 3D-графикой.');
     };
     intro.onWarn = (m) => { if (!dead) setWarn(m); };
-    intro.onLoop = () => score.start(0);
     intro
       .init()
       .then(() => {
@@ -94,30 +93,16 @@ export default function App() {
       });
     return () => {
       dead = true;
-      score.dispose();
-      scoreRef.current = null;
       intro.dispose();
       if (introRef.current === intro) introRef.current = null;
       if ((window as any).__intro === intro) delete (window as any).__intro;
     };
   }, []);
 
-  // конфигурация → движок и звук; сохранение в localStorage
-  const resync = useRef<number>(0);
+  // конфигурация → движок; сохранение в localStorage
   useEffect(() => {
     const intro = introRef.current;
-    if (intro && ready) {
-      intro.setConfig(cfg);
-      const g = cfg.general;
-      const score = scoreRef.current;
-      if (score) {
-        score.setTiming(g.impact, g.speed, totalDuration(cfg), g.volume);
-        window.clearTimeout(resync.current);
-        resync.current = window.setTimeout(() => {
-          if (score.enabled && !pausedRef.current && !recordingRef.current) score.start(introRef.current?.t ?? 0);
-        }, 450);
-      }
-    }
+    if (intro && ready) intro.setConfig(cfg);
     const id = window.setTimeout(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(cfg)); } catch { /* квота */ } }, 300);
     return () => window.clearTimeout(id);
   }, [cfg, ready]);
@@ -134,7 +119,13 @@ export default function App() {
     pausedRef.current = false;
     setPaused(false);
     introRef.current?.play(0);
-    scoreRef.current?.start(0);
+  }, []);
+
+  const changeClipMode = useCallback((mode: ClipMode) => {
+    setClipMode(mode);
+    pausedRef.current = false;
+    setPaused(false);
+    introRef.current?.setClipMode(mode);
   }, []);
 
   const togglePause = useCallback(() => {
@@ -144,12 +135,10 @@ export default function App() {
       pausedRef.current = false;
       setPaused(false);
       intro.play(Math.min(intro.t, intro.duration));
-      scoreRef.current?.start(intro.t);
     } else {
       pausedRef.current = true;
       setPaused(true);
       intro.freeze = intro.t;
-      scoreRef.current?.stop();
     }
   }, []);
 
@@ -157,23 +146,6 @@ export default function App() {
     if (document.fullscreenElement) document.exitFullscreen();
     else rootRef.current?.requestFullscreen?.();
   };
-
-  const toggleSound = useCallback(async () => {
-    const score = scoreRef.current;
-    if (!score) return;
-    if (score.enabled) {
-      score.disable();
-      setSound(false);
-    } else {
-      try {
-        await score.enable();
-        setSound(true);
-        if (!pausedRef.current) score.start(introRef.current?.t ?? 0);
-      } catch (e) {
-        console.error(e);
-      }
-    }
-  }, []);
 
   useEffect(() => {
     poke();
@@ -188,12 +160,11 @@ export default function App() {
       }
       if (e.code === 'KeyP') togglePause();
       if (e.code === 'KeyF') toggleFs();
-      if (e.code === 'KeyM') toggleSound();
       if (e.key === 'Escape') { setOpenSettings(false); setOpenComp(false); }
     };
     window.addEventListener('keydown', onKey);
     return () => { window.removeEventListener('keydown', onKey); window.clearTimeout(hideTimer.current); };
-  }, [poke, replay, togglePause, toggleSound]);
+  }, [poke, replay, togglePause]);
 
   const seekTo = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const intro = introRef.current;
@@ -202,19 +173,7 @@ export default function App() {
     const time = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * intro.duration;
     if (pausedRef.current) { intro.freeze = time; intro.t = time; return; }
     intro.seek(time);
-    scoreRef.current?.start(time);
   }, []);
-
-  // браузеры запрещают автозвук: первый клик по сцене включает саундтрек (клики по панелям не считаются)
-  useEffect(() => {
-    const onFirst = (e: PointerEvent) => {
-      if (e.target instanceof HTMLElement && e.target.closest('button,a,video,input,select,textarea,label,[role=slider],[data-panel]')) return;
-      window.removeEventListener('pointerdown', onFirst, true);
-      if (!scoreRef.current?.enabled) toggleSound();
-    };
-    window.addEventListener('pointerdown', onFirst, true);
-    return () => window.removeEventListener('pointerdown', onFirst, true);
-  }, [toggleSound]);
 
   const record = async () => {
     const intro = introRef.current;
@@ -223,39 +182,44 @@ export default function App() {
     setRecording(true);
     setRecordError(null);
     setProgress(0);
-    const score = scoreRef.current;
-    score?.stop();
     try {
       const g = cfgRef.current.general;
-      score?.setTiming(g.impact, g.speed, totalDuration(cfgRef.current), g.volume);
-      const audio = g.exportAudio ? await (score ?? new ScorePlayer()).getBuffer() : undefined;
-      const blob = await intro.record(setProgress, audio);
+      const blob = await intro.record(setProgress);
       const extension = blob.type === 'video/mp4' ? 'mp4' : 'webm';
-      if (audio && !intro.lastExportHadAudio) setRecordError('Видео создано без звука: браузер не поддерживает аудиокодек для экспорта.');
-      setVideo({ url: URL.createObjectURL(blob), name: `${(g.fileName || 'intro').replace(/[^\w.\-а-яА-ЯёЁ ]+/g, '_')}.${extension}` });
+      const configuredStem = g.fileName.trim();
+      const stem = (configuredStem || clipMode).replace(/[^\w.\-а-яА-ЯёЁ ]+/g, '_');
+      const suffix = clipMode === 'intro' || !configuredStem ? '' : `-${clipMode}`;
+      setVideo({ url: URL.createObjectURL(blob), name: `${stem}${suffix}.${extension}` });
     } catch (e) {
       console.error(e);
       setRecordError(e instanceof Error ? e.message : String(e));
     } finally {
       recordingRef.current = false;
       setRecording(false);
-      if (!pausedRef.current) score?.start(intro.t);
     }
   };
 
   /* ------------------------------------------------------------ главы таймлайна (реальное время) */
   const g = cfg.general;
-  const duration = totalDuration(cfg);
+  const sceneDuration = totalDuration(cfg);
+  const duration = sceneDuration + (clipMode === 'outro' ? OUTRO_CREDITS_DURATION : 0);
   const real = (tau: number) => (tau < DESIGN_IMPACT ? (tau * g.impact) / DESIGN_IMPACT : g.impact + (tau - DESIGN_IMPACT) / g.speed);
   const L = cfg.layers;
-  const chapters = [
+  const storyChapters = [
     { t: real(1.05), label: 'Свет' },
     { t: g.impact, label: 'Эмблема' },
     { t: real(L.title.start + L.title.delay), label: 'Название' },
     { t: real(L.subtitle.start + L.subtitle.delay), label: 'Подзаголовок' },
     { t: real(L.date.start + L.date.delay), label: 'Дата' },
     { t: real(10.9), label: 'Блик' },
-  ].filter((c) => c.t >= 0 && c.t <= duration);
+  ].filter((c) => c.t >= 0 && c.t <= sceneDuration);
+  const chapters = clipMode === 'background' ? [] : [
+    ...storyChapters.map((c) => ({
+      ...c,
+      t: clipMode === 'outro' ? sceneDuration - c.t : c.t,
+    })),
+    ...(clipMode === 'outro' ? [{ t: sceneDuration, label: 'Финальные титры' }] : []),
+  ];
   const EW = Math.round(g.width / 2) * 2, EH = Math.round((EW * 9) / 16 / 2) * 2;
 
   const openLayerSettings = (id: string) => { setSelected(id); setTab('layer'); setOpenSettings(true); };
@@ -311,7 +275,7 @@ export default function App() {
               onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); seekTo(e); }}
               onPointerMove={(e) => { if (e.buttons) seekTo(e); }}
               role="slider"
-              aria-label="Позиция в интро"
+              aria-label={`Позиция: ${CLIP_OPTIONS.find(([mode]) => mode === clipMode)?.[1] || 'ролик'}`}
               aria-valuemin={0}
               aria-valuemax={Math.round(duration)}
             >
@@ -325,6 +289,27 @@ export default function App() {
               </div>
             </div>
 
+            <div
+              className="absolute left-4 right-24 top-4 z-30 flex justify-center transition-opacity duration-500"
+              style={{ opacity: uiVisible || panelOpen ? 1 : 0, pointerEvents: uiVisible || panelOpen ? 'auto' : 'none' }}
+            >
+              <label htmlFor="clip-mode" className="sr-only">Выбор ролика</label>
+              <div className="relative w-full max-w-xs min-w-0">
+                <select
+                  id="clip-mode"
+                  aria-label="Тип ролика"
+                  value={clipMode}
+                  disabled={recording}
+                  onChange={(e) => changeClipMode(e.target.value as ClipMode)}
+                  className="w-full max-w-full appearance-none truncate rounded-full border border-amber-300/35 bg-black/70 py-2 pl-4 pr-9 text-[10px] tracking-[0.2em] uppercase text-amber-100/90 shadow-lg backdrop-blur-md outline-none transition hover:border-amber-300/70 focus:border-amber-300/70 disabled:opacity-50"
+                  style={{ colorScheme: 'dark', maxWidth: '100%' }}
+                >
+                  {CLIP_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-amber-100/60" aria-hidden>⌄</span>
+              </div>
+            </div>
+
             {/* минималистичные кнопки: композиция и настройки */}
             <div
               className="absolute right-4 top-4 z-30 flex items-center gap-2 transition-opacity duration-500"
@@ -334,14 +319,6 @@ export default function App() {
               <RoundBtn label="Настройки" active={openSettings} onClick={() => setOpenSettings((v) => !v)}><GearIcon /></RoundBtn>
             </div>
 
-            {!sound && (
-              <button
-                onClick={toggleSound}
-                className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 text-[10px] tracking-[0.3em] uppercase rounded-full border border-amber-300/30 text-amber-100/80 bg-black/40 backdrop-blur-md animate-pulse hover:border-amber-300/70 transition"
-              >
-                <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="M15.5 8.5a5 5 0 0 1 0 7" />} /> Включить звук
-              </button>
-            )}
             {recordError && <div role="alert" className="absolute top-16 left-4 right-4 text-center text-amber-100 bg-black/80 p-3 text-sm">{recordError}</div>}
             <div
               onFocus={() => { window.clearTimeout(hideTimer.current); setUiVisible(true); }}
@@ -353,10 +330,6 @@ export default function App() {
               <Btn onClick={replay} disabled={recording}><Icon d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5" /> Повторить</Btn>
               <Btn onClick={togglePause} disabled={recording} active={paused}>
                 {paused ? <Icon d="M7 4v16l13-8z" /> : <Icon d="M8 5v14M16 5v14" />} {paused ? 'Продолжить' : 'Пауза'}
-              </Btn>
-              <Btn onClick={toggleSound} active={sound}>
-                {sound ? <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" />} /> : <Icon d="M11 5 6 9H2v6h4l5 4V5Z" extra={<path d="m22 9-6 6m0-6 6 6" />} />}
-                Звук
               </Btn>
               <Btn onClick={record} disabled={recording}>
                 <Icon d="M12 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0" extra={<circle cx="12" cy="12" r="9" />} />
