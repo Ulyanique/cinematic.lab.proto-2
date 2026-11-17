@@ -17,7 +17,7 @@ const fmt = (t: number) => `${t.toFixed(1)}`;
 const CLIP_OPTIONS: [ClipMode, string][] = [
   ['intro', 'Интро'],
   ['outro', 'Аутро · обратная анимация'],
-  ['background', 'Фон · логотип и название'],
+  ['background', 'Фон · зацикленный финал интро'],
 ];
 
 const Icon = ({ d, extra }: { d: string; extra?: React.ReactNode }) => (

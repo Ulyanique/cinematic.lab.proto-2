@@ -9,7 +9,7 @@ import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { Pass, FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
 import { MeshSurfaceSampler } from 'three/examples/jsm/math/MeshSurfaceSampler.js';
 import { fontOf, loadFontFace } from './fonts';
-import { DEFAULT_CONFIG, DESIGN_IMPACT, cloneConfig, totalDuration, type Config } from './config';
+import { DEFAULT_CONFIG, DESIGN_IMPACT, baseDuration, cloneConfig, totalDuration, type Config } from './config';
 import { EASE, logoXf, letterXf } from './anim';
 
 import {
@@ -1253,7 +1253,10 @@ export class Intro {
     // Зацикливание: в конце ролик гаснет (0.45 с), поэтому переход на новый круг не выглядит
     // как «камера ушла в черноту» — кадр уходит в чёрный плавно.
     const tail = this.duration;
-    if (this.playing && this.freeze === null && this.cfg.general.loop && this.t > tail + 0.35) {
+    const autoLoop = this.clipMode === 'background';
+    const shouldLoop = autoLoop || (this.clipMode === 'intro' && this.cfg.general.loop);
+    const loopAt = autoLoop ? tail : tail + 0.35;
+    if (this.playing && this.freeze === null && shouldLoop && this.t > loopAt) {
       this.play(0);
       this.t = 0;
       frameDelta = 1 / this.cfg.general.fps;
@@ -1281,10 +1284,21 @@ export class Intro {
     const duration = this.duration;
     const elapsed = Math.max(0, Math.min(duration, real));
     const reverse = this.clipMode === 'outro';
+    const backgroundOnly = this.clipMode === 'background';
+    const frameStep = Math.max(1 / this.cfg.general.fps, Math.abs(frameDelta)) * (reverse ? -1 : 1);
+
+    if (backgroundOnly) {
+      // Hold the intro's completed composition while cyclic time animates its final-state details.
+      const phase = elapsed / duration;
+      const finalT = Math.max(this.warp(duration), baseDuration);
+      const motionT = finalT + Math.sin(phase * Math.PI * 2) * 0.65;
+      this.updateDesign(motionT, elapsed, frameStep);
+      return;
+    }
+
     // Match the intro's sampled frames exactly, from its final rendered frame back to frame zero.
     const lastFrameTime = Math.max(0, (Math.round(duration * this.cfg.general.fps) - 1) / this.cfg.general.fps);
     const sceneTime = reverse ? Math.max(0, lastFrameTime - elapsed) : elapsed;
-    const frameStep = Math.max(1 / this.cfg.general.fps, Math.abs(frameDelta)) * (reverse ? -1 : 1);
     this.updateDesign(this.warp(sceneTime), sceneTime, frameStep);
   }
 
@@ -1296,10 +1310,12 @@ export class Intro {
   updateDesign(t: number, real: number, frameDelta = 1 / this.cfg.general.fps) {
     const C = this.cfg, G = C.general, CM = C.camera, PO = C.post, LY = C.layers;
     const backgroundOnly = this.clipMode === 'background';
+    const backgroundPhase = backgroundOnly ? clamp01(real / Math.max(0.001, this.duration)) : 0;
+    const backgroundFinalT = backgroundOnly ? Math.max(this.warp(this.duration), baseDuration) : 0;
     const BG = LY.background, LG = LY.logo, CP = LY.compass, TT = LY.title;
     const SB = LY.subtitle, DT = LY.date, DV = LY.dividers, RG = LY.rings, PT = LY.particles, FX = LY.fx;
     const lt = (id: string) => t - LY[id].delay;
-    const fxk = (v: number) => (FX.enabled && !backgroundOnly ? v : 0);
+    const fxk = (v: number) => (FX.enabled ? v : 0);
     const d2r = Math.PI / 180;
 
     this.U.uTime.value = t;
@@ -1314,8 +1330,8 @@ export class Intro {
     // camera: a slow cinematic push with parallax
     const ck = backgroundOnly ? 1 : easeInOutSine(seg(t, 0, 12.5));
     this.camera.position.set(
-      (1 - ck) * CM.startX + Math.sin(t * 0.33) * (backgroundOnly ? 0.035 : 0.1) * CM.sway,
-      (1 - ck) * CM.startY + Math.cos(t * 0.27) * (backgroundOnly ? 0.02 : 0.06) * CM.sway,
+      (1 - ck) * CM.startX + Math.sin(t * 0.33) * 0.1 * CM.sway,
+      (1 - ck) * CM.startY + Math.cos(t * 0.27) * 0.06 * CM.sway,
       CM.distance + (1 - ck) * CM.push
     );
     // удар в момент появления эмблемы: короткий «толчок» камеры и дрожь
@@ -1348,8 +1364,7 @@ export class Intro {
     const fadeOutAt = !backgroundOnly && !reverseOutro && this.forced && G.fadeOut ? dur : !backgroundOnly && !reverseOutro && G.loop ? dur + 0.35 : -1;
     const fadeFloor = this.forced ? 0 : 0.12;
     const fadeOut = fadeOutAt > 0 ? 1 - (1 - fadeFloor) * easeInOutSine(seg(real, fadeOutAt - 0.35, fadeOutAt)) : 1;
-    const outroFadeFloor = this.forced || !G.loop ? 0 : 0.12;
-    const outroFade = reverseOutro ? 1 - (1 - outroFadeFloor) * easeInOutSine(seg(this.t, dur - 0.35, dur)) : 1;
+    const outroFade = reverseOutro ? 1 - easeInOutSine(seg(this.t, dur - 0.35, dur)) : 1;
     F.uFade.value = fadeIn * (1 - dip) * fadeOut * outroFade;
     F.uTime.value = t;
     F.uVig.value = PO.vignette;
@@ -1379,12 +1394,12 @@ export class Intro {
     F.uSlitMix.value = backgroundOnly || !PO.slit ? 0 : 1 - easeInOutSine(seg(so, 0.012, 0.045));
     F.uLineVisible.value = PO.ignition && !backgroundOnly ? 1 : 0;
     // фокус-пулл: из мягкого боке в резкость, на ударе — короткий «вдох» расфокуса
-    F.uBlur.value = backgroundOnly ? 0 : (0.014 * (1 - easeInOutSine(seg(t, 1.1, 4.4))) + 0.0045 * burst(t, 4.5, 0.03, 0.18)) * PO.focus;
+    F.uBlur.value = (0.014 * (1 - easeInOutSine(seg(t, 1.1, 4.4))) + 0.0045 * burst(t, 4.5, 0.03, 0.18)) * PO.focus;
     // ударная волна и хроматика
     const shk = seg(t, 4.5, 6.4);
     F.uShock.value = easeOutCubic(shk) * 1.15;
     F.uShockAmp.value = (t < 4.5 ? 0 : Math.pow(1 - shk, 1.6)) * fxk(FX.shock);
-    F.uCA.value = backgroundOnly ? 0 : burst(t, 4.5, 0.04, 0.45) * 0.9 * PO.aberration;
+    F.uCA.value = burst(t, 4.5, 0.04, 0.45) * 0.9 * PO.aberration;
     F.uPulse.value = burst(t, 4.5, 0.03, 0.2) * 0.05 * fxk(FX.flash);
     const lcx = this.logoCenter.x + LG.x, lcy = this.logoCenter.y + LG.y;
     const lp = this._v3.set(lcx, lcy, 0).project(this.camera);
@@ -1392,10 +1407,10 @@ export class Intro {
 
     // environment drifts so reflections glide over the metal
     const envRot = backgroundOnly
-      ? Math.sin((real / Math.max(0.01, this.duration)) * Math.PI * 2) * 0.18
+      ? Math.sin(backgroundFinalT * 0.32) * 0.35 + backgroundFinalT * 0.06 + Math.sin(backgroundPhase * Math.PI * 2) * 0.18
       : Math.sin(t * 0.32) * 0.35 + t * 0.06;
     this.scene.environmentRotation.y = envRot;
-    this.scene.environmentIntensity = backgroundOnly ? 0.72 : 0.4 + 0.4 * easeOutCubic(seg(t, 3.8, 6.0));
+    this.scene.environmentIntensity = 0.4 + 0.4 * easeOutCubic(seg(t, 3.8, 6.0));
 
     // background light
     const bu = this.bgMat.uniforms;
@@ -1409,7 +1424,7 @@ export class Intro {
 
     // particles
     const pt = lt('particles');
-    this.dustPts.visible = this.bokehPts.visible = PT.enabled && !backgroundOnly;
+    this.dustPts.visible = this.bokehPts.visible = PT.enabled;
     this.dustU.uIn.value = easeOutCubic(seg(pt, 0.2, 2.5)) * PT.brightness;
     this.bokehU.uIn.value = easeOutCubic(seg(pt, 0.6, 3.5)) * PT.brightness;
     this.dustU.uDens.value = PT.dust;
@@ -1422,24 +1437,24 @@ export class Intro {
     const cornerX = cornerY * this.camera.aspect;
     this.cornerRings[0].position.set(-cornerX, cornerY, -10);
     this.cornerRings[1].position.set(cornerX, -cornerY, -10);
-    this.cornerRings.forEach((g) => { g.visible = RG.enabled && !backgroundOnly; g.scale.setScalar(RG.scale); });
+    this.cornerRings.forEach((g) => { g.visible = RG.enabled; g.scale.setScalar(RG.scale); });
 
     // arcs
     const rt = lt('rings');
     this.arcs.forEach(({ mesh, t0, t1, speed, a0 }) => {
-      mesh.visible = !backgroundOnly;
-      mesh.rotation.z = t * speed * RG.speed;
+      mesh.visible = RG.enabled;
+      mesh.rotation.z = t * speed * RG.speed + backgroundPhase * Math.PI * 2;
       mesh.material.uniforms.uProg.value = easeInOutSine(seg(rt, t0, t1));
       mesh.material.uniforms.uAlpha.value = a0 * RG.opacity;
     });
     this.dots.forEach(({ s, size, t0, R, angle, speed }) => {
-      const a = angle + t * speed * RG.speed;
+      const a = angle + t * speed * RG.speed + backgroundPhase * Math.PI * 2;
       s.position.set(Math.cos(a) * R, Math.sin(a) * R, 0);
       const k = easeOutBack(seg(rt, t0, t0 + 0.7));
       const pulse = 1 + 0.25 * Math.sin(t * 2.4 + t0 * 5);
       const sc = Math.max(0, k) * size * pulse * (1 + burst(t, 4.55, 0.1, 0.6) * 0.8) * (RG.nodes ? RG.opacity : 0);
       s.scale.set(sc, sc, 1);
-      s.visible = !backgroundOnly && sc > 0.001;
+      s.visible = RG.enabled && sc > 0.001;
     });
 
     // logo swarm assembly
@@ -1447,15 +1462,14 @@ export class Intro {
     const isSwarm = LG.preset === 'swarm';
     this.swarmU.uAssemble.value = backgroundOnly ? 1 : easeInOutSine(seg(gt, 1.6, 4.55));
     // на ударе рой кратко приглушаем (иначе 18 000 аддитивных точек выжигают силуэт) и быстрее растворяем
-    this.swarmU.uFade.value = backgroundOnly ? 0 : isSwarm ? easeOutCubic(seg(gt, 1.5, 2.4)) * (1 - 0.75 * burst(t, 4.5, 0.03, 0.22)) * (1 - easeInOutSine(seg(gt, 4.5, 4.95))) : 0;
+    this.swarmU.uFade.value = isSwarm ? easeOutCubic(seg(gt, 1.5, 2.4)) * (1 - 0.75 * burst(t, 4.5, 0.03, 0.22)) * (1 - easeInOutSine(seg(gt, 4.5, 4.95))) : 0;
     this.swarmU.uDens.value = LG.swarm;
     this.logoRoot.visible = backgroundOnly || LG.enabled;
-    this.logoInner.children.filter((obj) => obj.isPoints).forEach((obj) => { obj.visible = !backgroundOnly; });
     const rot = LG.tilt * (1 - easeInOutCubic(seg(gt, 1.4, 8.0)));
-    this.logoRoot.rotation.y = backgroundOnly ? 0 : rot + Math.sin(t * 0.5) * 0.015 * LG.float;
-    this.logoRoot.rotation.x = backgroundOnly ? 0 : Math.sin(t * 0.4) * 0.012 * LG.float;
-    this.logoRoot.position.set(lcx, lcy + (backgroundOnly ? 0 : Math.sin(t * 0.7) * 0.025 * LG.float), this.stackZ.logo);
-    this.logoRoot.scale.setScalar(LG.scale * (backgroundOnly ? 1 : 1 + 0.04 * (1 - easeOutCubic(seg(gt, 4.2, 8)))));
+    this.logoRoot.rotation.y = rot + Math.sin(t * 0.5) * 0.015 * LG.float;
+    this.logoRoot.rotation.x = Math.sin(t * 0.4) * 0.012 * LG.float;
+    this.logoRoot.position.set(lcx, lcy + Math.sin(t * 0.7) * 0.025 * LG.float, this.stackZ.logo);
+    this.logoRoot.scale.setScalar(LG.scale * (1 + 0.04 * (1 - easeOutCubic(seg(gt, 4.2, 8)))));
 
     const n = this.logoParts.length;
     const ease = EASE[LG.easing] || EASE.cubic;
@@ -1473,7 +1487,7 @@ export class Intro {
       const u = m.material.userData.u;
       u.uReveal.value = xf.reveal;
       m.visible = backgroundOnly || k > 0.0001;
-      u.uFlash.value = backgroundOnly ? 0 : (burst(t, 4.52, 0.05, 0.5) * 0.24 + burst(gt, t0 + LG.duration * 0.9, 0.05, 0.4) * 0.3) * LG.flash;
+      u.uFlash.value = (burst(t, 4.52, 0.05, 0.5) * 0.24 + burst(gt, t0 + LG.duration * 0.9, 0.05, 0.4) * 0.3) * LG.flash;
       this.setCol(u.uGD.value, LG.deep); this.setCol(u.uGM.value, LG.mid); this.setCol(u.uGT.value, LG.top);
       u.uGradY.value.set(-0.1 + LG.y, 3.15 + LG.y);
       m.material.roughness = LG.roughness;
@@ -1490,7 +1504,7 @@ export class Intro {
 
     // дуги циркуля вокруг эмблемы (повторяют трансформацию эмблемы)
     const ct = lt('compass');
-    this.compassRoot.visible = !backgroundOnly && CP.enabled;
+    this.compassRoot.visible = CP.enabled;
     this.compassRoot.position.copy(this.logoRoot.position);
     this.compassRoot.rotation.copy(this.logoRoot.rotation);
     this.compassRoot.scale.copy(this.logoRoot.scale);
@@ -1514,7 +1528,6 @@ export class Intro {
     // title letters
     const tt = lt('title');
     this.titleRoot.visible = backgroundOnly || TT.enabled;
-    this.titleRoot.children.filter((obj) => obj.isPoints).forEach((obj) => { obj.visible = !backgroundOnly; });
     this.titleRoot.position.set(TT.x, TT.y + -0.66 * (1 - TT.scale), this.stackZ.title);
     this.titleRoot.scale.setScalar(TT.scale);
     const tease = EASE[TT.easing] || EASE.cubic;
@@ -1527,7 +1540,7 @@ export class Intro {
       mesh.scale.setScalar(Math.max(1e-4, xf.s));
       const u = mesh.material.userData.u;
       u.uReveal.value = xf.reveal;
-      u.uFlash.value = backgroundOnly ? 0 : burst(tt, land, 0.04, 0.38) * 1.1 * TT.flash;
+      u.uFlash.value = burst(tt, land, 0.04, 0.38) * 1.1 * TT.flash;
       this.setCol(u.uGD.value, TT.deep); this.setCol(u.uGM.value, TT.mid); this.setCol(u.uGT.value, TT.top);
       u.uGradY.value.set(-1.15 + TT.y, -0.1 + TT.y);
       mesh.material.roughness = TT.roughness;
@@ -1536,7 +1549,9 @@ export class Intro {
     const ts = TT.start - 5.75 + TT.delay; // сдвиг событий, привязанных к названию
 
     // sweeping light (title + final shimmer)
-    const sw = this.sweepState(t - (TT.start - 5.75));
+    const sw = backgroundOnly
+      ? { x: -9 + 18 * easeInOutSine(backgroundPhase), amt: Math.sin(Math.PI * backgroundPhase) }
+      : this.sweepState(t - (TT.start - 5.75));
     const swAmt = sw.amt * fxk(FX.sweep);
     this.sweepLight.position.x = sw.x;
     this.sweepLight.intensity = swAmt * 58;
@@ -1573,13 +1588,13 @@ export class Intro {
       });
     };
     const l1 = easeInOutCubic(seg(dt, DV.start1, DV.start1 + d1));
-    const on1 = !backgroundOnly && DV.enabled && DV.first;
+    const on1 = DV.enabled && DV.first;
     updateLinePair(this.div1, l1, on1 ? DV.intensity1 : 0, DV.y1, DV.length1);
     this.popDiamond(this.div1.d, seg(dt, DV.start1 - 0.1, DV.start1 + 0.6), t, 0);
     this.div1.d.visible = this.div1.d.visible && on1 && DV.diamonds;
     this.div1.d.position.y = this.div1.d.userData.baseY + DV.y1;
     const l2 = easeInOutCubic(seg(dt, DV.start2, DV.start2 + d2));
-    const on2 = !backgroundOnly && DV.enabled && DV.second;
+    const on2 = DV.enabled && DV.second;
     updateLinePair(this.div2, l2, on2 ? DV.intensity2 : 0, DV.y2, DV.length2);
     this.popDiamond(this.div2.d, seg(dt, DV.start2 - 0.1, DV.start2 + 0.55), t, 1.7);
     this.div2.d.visible = this.div2.d.visible && on2 && DV.diamonds;
@@ -1587,7 +1602,7 @@ export class Intro {
 
     // The bars bypass animated HDR extraction and final-pass grain; reapply only the
     // global fade, vignette and opening slit so their look stays in sync with the scene.
-    this.dividerOverlay.enabled = !backgroundOnly && DV.enabled && (this.div1.L.visible || this.div2.L.visible);
+    this.dividerOverlay.enabled = DV.enabled && (this.div1.L.visible || this.div2.L.visible);
     const du = this.dividerOverlay.material.uniforms;
     du.uAspect.value = this.camera.aspect;
     du.uVignette.value = PO.vignette;
@@ -1596,13 +1611,8 @@ export class Intro {
     du.uSlitMix.value = F.uSlitMix.value;
 
     // subtitle + date
-    if (backgroundOnly) {
-      this.sub.visible = false;
-      this.date.visible = false;
-    } else {
-      this.updateText(this.sub, SB, t, 1.3, 0, 0.55, 0.25);
-      this.updateText(this.date, DT, t, 1.1, 1, 0.5, 0.2);
-    }
+    this.updateText(this.sub, SB, t, 1.3, 0, 0.55, 0.25);
+    this.updateText(this.date, DT, t, 1.1, 1, 0.5, 0.2);
 
     // FX
     const setFlare = (f, v) => {
@@ -1659,7 +1669,7 @@ export class Intro {
     this.waveTitle.material.uniforms.uW.value = 0.09 + w2 * 0.12;
 
     // анаморфные полосы: нарастают к удару, вспыхивают на нём, оживают на названии и финальном блике
-    this.streak.strength = backgroundOnly ? 0 : PO.streak * Math.min(1.1,
+    this.streak.strength = PO.streak * Math.min(1.1,
       0.1 * easeOutCubic(seg(t, 2.6, 4.5)) +
       0.3 * burst(t, 4.5, 0.05, 0.8) +
       0.1 * burst(t - ts, 7.7, 0.25, 0.8) +
@@ -1690,7 +1700,7 @@ export class Intro {
     });
 
     // bloom breathes with the story
-    this.bloom.strength = backgroundOnly ? PO.bloom * 0.55 : PO.bloom * (0.5 + 0.1 * burst(t, 4.5, 0.08, 0.6) + 0.1 * burst(t, TL.sweep2, 0.4, 0.9));
+    this.bloom.strength = PO.bloom * (0.5 + 0.1 * burst(t, 4.5, 0.08, 0.6) + 0.1 * burst(t, TL.sweep2, 0.4, 0.9));
     this.bloom.radius = PO.bloomRadius;
     this.bloom.threshold = PO.bloomThreshold;
   }
